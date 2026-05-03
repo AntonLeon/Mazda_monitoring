@@ -7,8 +7,8 @@ import asyncio
 from telethon import TelegramClient, events
 from dotenv import load_dotenv
 
-# Загружаем секреты из .env_monitor (только на сервере)
-load_dotenv('/root/bot/.env_monitor')
+# Загружаем секреты из .env_monitor (файл ТОЛЬКО на сервере)
+load_dotenv('/root/monitor/.env_monitor')
 
 API_ID = int(os.getenv("MONITOR_API_ID"))
 API_HASH = os.getenv("MONITOR_API_HASH")
@@ -42,7 +42,7 @@ KEYWORDS = [
 ]
 
 # ------------------------------------------------------------
-# Остальной код (логика, обработка сообщений) — ИДЁТ ДАЛЕЕ
+# Остальной код (логика, обработка сообщений)
 # ------------------------------------------------------------
 client = TelegramClient("mazda_session", API_ID, API_HASH)
 
