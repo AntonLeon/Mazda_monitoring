@@ -184,6 +184,8 @@ class Settings:
     session_path: Path = field(default_factory=lambda: BASE_DIR / "mazda_session")
     notify_users: List[str] = field(default_factory=list)
     chats: List[str] = field(default_factory=lambda: list(DEFAULT_CHATS))
+    all_chats: bool = False
+    chats_exclude: List[str] = field(default_factory=list)
     bot_token: Optional[str] = None
     min_score: int = 3
     heartbeat_minutes: int = 0
@@ -194,8 +196,9 @@ class Settings:
     dry_run: bool = False
 
     def summary(self) -> str:
+        scope = "все группы аккаунта" if self.all_chats else f"чатов: {len(self.chats)}"
         return (
-            f"режим: {self.mode}, чатов: {len(self.chats)}, получателей: {len(self.notify_users)}, "
+            f"режим: {self.mode}, {scope}, получателей: {len(self.notify_users)}, "
             f"порог веса: {self.min_score}, уведомления: "
             f"{'через бота' if self.bot_token else 'с личного аккаунта'}, настройки: {self.env_file or 'переменные окружения'}"
         )
@@ -238,7 +241,16 @@ def load_settings(env: Optional[Dict[str, str]] = None, explicit_env_file: Optio
     settings.notify_users = notify
 
     chats = split_list(values.get("MONITOR_CHATS", ""))
-    settings.chats = chats or list(DEFAULT_CHATS)
+    if chats and chats[0].strip().lower() in {"all", "*", "все", "any"}:
+        # «all» — слушать все группы аккаунта; отдельные чаты в этом режиме не нужны,
+        # исключения задаются через MONITOR_CHATS_EXCLUDE
+        settings.all_chats = True
+        if len(chats) > 1:
+            LOG.warning("MONITOR_CHATS=all: список чатов после all игнорируется, "
+                        "исключения задавайте в MONITOR_CHATS_EXCLUDE")
+        chats = []
+    settings.chats = chats or ([] if settings.all_chats else list(DEFAULT_CHATS))
+    settings.chats_exclude = split_list(values.get("MONITOR_CHATS_EXCLUDE", ""))
 
     settings.bot_token = (values.get("MONITOR_BOT_TOKEN") or "").strip() or None
 
@@ -518,6 +530,27 @@ def ensure_session_permissions(path: Path) -> None:
             LOG.warning("Не удалось изменить права %s: %s", candidate, exc)
 
 
+async def list_account_groups(client) -> List[object]:
+    """Все группы и каналы, в которых состоит аккаунт (для режима MONITOR_CHATS=all)."""
+    groups: List[object] = []
+    async for dialog in client.iter_dialogs():
+        if dialog.is_group or dialog.is_channel:
+            groups.append(dialog.entity)
+    return groups
+
+
+async def resolve_excluded(client, targets: Sequence[str]) -> set:
+    """id групп, которые слушать не нужно."""
+    excluded = set()
+    for raw in targets:
+        try:
+            entity = await client.get_entity(normalize_chat_target(raw))
+            excluded.add(abs(int(getattr(entity, "id", 0))))
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("Не удалось разобрать исключение %s: %s", raw, exc)
+    return excluded
+
+
 async def run_user_mode(settings: Settings) -> int:
     """Мониторинг с личного аккаунта (нужны api_id, api_hash и файл сессии)."""
     from telethon import TelegramClient, events
@@ -534,14 +567,24 @@ async def run_user_mode(settings: Settings) -> int:
     me = await client.get_me()
     LOG.info("Аккаунт: %s (id %s)", getattr(me, "first_name", "?"), getattr(me, "id", "?"))
 
-    resolved, failed = await resolve_chats(client, settings.chats)
-    if failed:
-        LOG.warning("Не удалось подключить чатов: %s", ", ".join(name for name, _ in failed))
-    if not resolved:
-        raise ConfigError(
-            "Ни один чат не найден. Проверьте MONITOR_CHATS: аккаунт должен состоять в этих чатах, "
-            "а юзернеймы — быть актуальными (надёжнее указывать числовые id)."
-        )
+    excluded: set = set()
+    if settings.all_chats:
+        # Слушаем все группы аккаунта: новые чаты подхватываются без перезапуска,
+        # потому что фильтр по списку не ставится — проверяем внутри обработчика.
+        resolved = await list_account_groups(client)
+        excluded = await resolve_excluded(client, settings.chats_exclude)
+        if not resolved:
+            raise ConfigError("Аккаунт не состоит ни в одной группе — слушать нечего.")
+        LOG.info("Слушаю все группы аккаунта: %s, исключено: %s", len(resolved), len(excluded))
+    else:
+        resolved, failed = await resolve_chats(client, settings.chats)
+        if failed:
+            LOG.warning("Не удалось подключить чатов: %s", ", ".join(name for name, _ in failed))
+        if not resolved:
+            raise ConfigError(
+                "Ни один чат не найден. Проверьте MONITOR_CHATS: аккаунт должен состоять в этих чатах, "
+                "а юзернеймы — быть актуальными (надёжнее указывать числовые id)."
+            )
 
     store = SeenStore(settings.state_file, ttl_hours=settings.seen_hours)
     notifier = Notifier(settings, client)
@@ -565,6 +608,12 @@ async def run_user_mode(settings: Settings) -> int:
         message = event.message
         if getattr(event, "out", False):  # свои же сообщения не пересылаем
             return
+        if settings.all_chats:
+            # в личных переписках не слушаем; исключённые чаты пропускаем
+            if not (getattr(event, "is_group", False) or getattr(event, "is_channel", False)):
+                return
+            if abs(int(getattr(message, "chat_id", 0))) in excluded:
+                return
         text = (message.text or "").strip()
         if len(text) < 10:
             return
@@ -608,8 +657,12 @@ async def run_user_mode(settings: Settings) -> int:
         store.add(keys[0])
         store.add(keys[1])
 
-    client.add_event_handler(handler, events.NewMessage(chats=resolved))
-    client.add_event_handler(handler, events.MessageEdited(chats=resolved))
+    if settings.all_chats:
+        client.add_event_handler(handler, events.NewMessage())
+        client.add_event_handler(handler, events.MessageEdited())
+    else:
+        client.add_event_handler(handler, events.NewMessage(chats=resolved))
+        client.add_event_handler(handler, events.MessageEdited(chats=resolved))
     LOG.info("Монитор запущен: %s", settings.summary())
 
     async def heartbeat() -> None:

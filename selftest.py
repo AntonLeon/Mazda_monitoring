@@ -233,6 +233,30 @@ def test_chat_targets():
     check("t.me без схемы разбирается", mon.normalize_chat_target("t.me/auto_zakazz25") == "auto_zakazz25")
 
 
+def test_all_chats_mode():
+    session = TMP_DIR / "all.session"
+    session.write_bytes(b"stub")
+    common = {
+        "MONITOR_API_ID": "1", "MONITOR_API_HASH": "x", "MONITOR_NOTIFY_USERS": "1",
+        "MONITOR_SESSION": str(session.with_suffix("")),
+    }
+    settings = mon.load_settings(env={**common, "MONITOR_CHATS": "all"})
+    check("режим «все группы» включается", settings.all_chats is True, str(settings.all_chats))
+    check("в этом режиме список чатов пуст", settings.chats == [], str(settings.chats))
+    check("в описании видно «все группы»", "все группы аккаунта" in settings.summary(), settings.summary())
+
+    settings = mon.load_settings(env={**common, "MONITOR_CHATS": "all", "MONITOR_CHATS_EXCLUDE": "@наш_чат, -100123"})
+    check("исключения разобраны", settings.chats_exclude == ["@наш_чат", "-100123"], str(settings.chats_exclude))
+
+    settings = mon.load_settings(env={**common, "MONITOR_CHATS": "@one,@two"})
+    check("обычный список чатов работает как раньше",
+          settings.all_chats is False and settings.chats == ["@one", "@two"], str(settings.chats))
+
+    settings = mon.load_settings(env=common)
+    check("без MONITOR_CHATS берутся шесть чатов из кода",
+          settings.chats == list(mon.DEFAULT_CHATS), str(settings.chats))
+
+
 def test_dry_run_flag():
     session = TMP_DIR / "dry.session"
     session.write_bytes(b"stub")
@@ -257,6 +281,7 @@ def main() -> int:
         test_notification_text,
         test_seen_store,
         test_chat_targets,
+        test_all_chats_mode,
         test_dry_run_flag,
     ):
         print(f"\n--- {test.__name__} ---")
