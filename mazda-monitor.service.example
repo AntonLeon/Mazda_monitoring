@@ -1,0 +1,29 @@
+# Пример systemd-юнита для монитора чатов.
+#
+#   sudo cp mazda-monitor.service.example /etc/systemd/system/mazda-monitor.service
+#   sudo nano /etc/systemd/system/mazda-monitor.service     # путь и User
+#   sudo systemctl daemon-reload && sudo systemctl enable --now mazda-monitor
+#   journalctl -u mazda-monitor -f
+#
+# .env_monitor и файл сессии лежат в WorkingDirectory; в unit их передавать не нужно —
+# скрипт читает настройки сам. Файл сессии должен принадлежать User из юнита, права 600.
+
+[Unit]
+Description=Mazda CX-5 chat monitor (Telegram)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/mazda_monitor
+ExecStart=/opt/mazda_monitor/venv/bin/python /opt/mazda_monitor/mazda_monitor.py
+User=mazda
+Group=mazda
+Restart=always
+RestartSec=15
+Environment=PYTHONUNBUFFERED=1
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

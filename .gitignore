@@ -1,0 +1,15 @@
+# Секреты и приватные данные: в репозиторий не попадают
+.env_monitor
+.env
+*.session
+*.session-journal
+monitor_state.json
+monitor.log
+*.log
+
+# Служебное
+__pycache__/
+*.pyc
+.venv/
+venv/
+.DS_Store
