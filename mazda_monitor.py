@@ -48,6 +48,21 @@ DEFAULT_CHATS = (
     "bambaleilatop",
 )
 
+# Файлы бота с теми, кто уже писал ему: таких людей мастерам показывать не нужно.
+# Пути по умолчанию — сервер (бот и монитор рядом) и локальная разработка.
+DEFAULT_KNOWN_USER_FILES = (
+    Path("/opt/mazda_bot/data/bot_users.json"),
+    Path("/opt/mazda_bot/data/contacts.json"),
+    Path("/opt/mazda_bot/data/bookings.json"),
+    BASE_DIR.parent / "Mazda_bot" / "data" / "bot_users.json",
+)
+
+
+def _resolve_path(value: str) -> Path:
+    path = Path(value).expanduser()
+    return path if path.is_absolute() else (BASE_DIR / path)
+
+
 # ============================== правила поиска клиентов ==============================
 # score — вес категории; чем выше, тем интереснее сообщение.
 # Отрицательные веса снижают итог, веса <= -50 означают «не уведомлять никогда»
@@ -186,6 +201,9 @@ class Settings:
     chats: List[str] = field(default_factory=lambda: list(DEFAULT_CHATS))
     all_chats: bool = False
     chats_exclude: List[str] = field(default_factory=list)
+    known_users_files: List[Path] = field(default_factory=list)
+    ignore_users: List[str] = field(default_factory=list)
+    known_users_refresh_minutes: int = 5
     bot_token: Optional[str] = None
     min_score: int = 3
     heartbeat_minutes: int = 0
@@ -272,6 +290,15 @@ def load_settings(env: Optional[Dict[str, str]] = None, explicit_env_file: Optio
         settings.state_file = path if path.is_absolute() else (BASE_DIR / path)
 
     settings.dry_run = (values.get("MONITOR_DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"})
+
+    known = split_list(values.get("MONITOR_KNOWN_USERS_FILE", ""))
+    if known:
+        settings.known_users_files = [_resolve_path(item) for item in known]
+    else:
+        settings.known_users_files = [path for path in DEFAULT_KNOWN_USER_FILES if path.exists()]
+    settings.ignore_users = split_list(values.get("MONITOR_IGNORE_USERS", ""))
+    settings.known_users_refresh_minutes = to_int(
+        values.get("MONITOR_KNOWN_USERS_REFRESH", ""), "MONITOR_KNOWN_USERS_REFRESH", default=5)
 
     # Режим: для личного аккаунта нужны api_id и api_hash, иначе — только бот
     if settings.api_id and settings.api_hash:
@@ -427,6 +454,94 @@ class SeenStore:
             os.replace(temp_path, self.path)
         except OSError as exc:
             LOG.warning("Не удалось сохранить %s: %s", self.path, exc)
+
+
+# ============================== те, кто уже писал боту ==============================
+
+
+class KnownUsers:
+    """Люди, которые уже общаются с ботом: их не показываем мастерам как новых клиентов.
+
+    Читает файлы бота (data/bot_users.json, contacts.json, bookings.json) и обновляет
+    список раз в несколько минут — бот пишет в них по мере обращений.
+    """
+
+    def __init__(self, files: Sequence[Path], extra: Sequence[str] = (), refresh_minutes: int = 5) -> None:
+        self.files = list(files)
+        self.refresh_seconds = max(refresh_minutes, 0) * 60
+        self.ids: set = set()
+        self.usernames: set = set()
+        self._loaded_at = 0.0
+        self._add_extra(extra)
+        self.refresh(force=True)
+
+    def _add_extra(self, extra: Sequence[str]) -> None:
+        for value in extra:
+            item = value.strip()
+            if not item:
+                continue
+            if re.fullmatch(r"-?\d+", item):
+                self.ids.add(int(item))
+            else:
+                self.usernames.add(item.lstrip("@").lower())
+
+    def refresh(self, force: bool = False) -> bool:
+        """Обновить список; возвращает True, если читали файлы."""
+        if not force and self.refresh_seconds:
+            if time.time() - self._loaded_at < self.refresh_seconds:
+                return False
+        if not force and not self.refresh_seconds:
+            return False
+
+        ids: set = set()
+        usernames: set = set()
+        for path in self.files:
+            try:
+                raw = json.loads(path.read_text(encoding="utf-8"))
+            except FileNotFoundError:
+                continue
+            except (OSError, ValueError) as exc:
+                LOG.warning("Список известных пользователей %s не прочитан: %s", path, exc)
+                continue
+
+            if isinstance(raw, dict):
+                for key, value in raw.items():
+                    if re.fullmatch(r"-?\d+", str(key)):
+                        ids.add(int(key))
+                    if isinstance(value, dict):
+                        name = str(value.get("username") or "").lstrip("@").lower()
+                        if name:
+                            usernames.add(name)
+            elif isinstance(raw, list):
+                for item in raw:
+                    if not isinstance(item, dict):
+                        continue
+                    for key_name in ("user_id", "id", "telegram_id"):
+                        candidate = item.get(key_name)
+                        if isinstance(candidate, int) or (isinstance(candidate, str) and candidate.isdigit()):
+                            ids.add(int(candidate))
+                            break
+                    name = str(item.get("username") or "").lstrip("@").lower()
+                    if name:
+                        usernames.add(name)
+
+        self.ids |= ids
+        self.usernames |= usernames
+        self._loaded_at = time.time()
+        return True
+
+    def is_known(self, user_id: Optional[int], username: Optional[str] = None) -> Optional[str]:
+        """Причина, по которой человека не показываем мастерам, или None."""
+        if user_id is not None and int(user_id) in self.ids:
+            return "уже писал боту"
+        if username:
+            if username.lstrip("@").lower() in self.usernames:
+                return "уже писал боту"
+        return None
+
+    def describe(self) -> str:
+        files = ", ".join(path.name for path in self.files) or "нет файлов"
+        return f"известных пользователей: {len(self.ids)} id и {len(self.usernames)} юзернеймов ({files})"
 
 
 # ============================== отправка уведомлений ==============================
@@ -588,7 +703,10 @@ async def run_user_mode(settings: Settings) -> int:
 
     store = SeenStore(settings.state_file, ttl_hours=settings.seen_hours)
     notifier = Notifier(settings, client)
-    stats = {"found": 0, "skipped": 0}
+    known = KnownUsers(settings.known_users_files, settings.ignore_users,
+                       settings.known_users_refresh_minutes)
+    LOG.info("Фильтр «уже писал боту»: %s", known.describe())
+    stats = {"found": 0, "skipped": 0, "known": 0}
 
     def evaluate(text: str) -> Optional[Tuple[int, List[str]]]:
         """Оценка сообщения: None — не наш случай."""
@@ -623,11 +741,7 @@ async def run_user_mode(settings: Settings) -> int:
             LOG.debug("Повтор уже отправляли: %s", keys[0])
             return
 
-        scored = evaluate(text)
-        if scored is None:
-            return
-        score, categories = scored
-
+        sender = None
         sender_name = "Неизвестный"
         try:
             sender = await event.get_sender()
@@ -636,6 +750,20 @@ async def run_user_mode(settings: Settings) -> int:
                     (getattr(sender, "first_name", None) or str(getattr(sender, "id", "Неизвестный")))
         except Exception as exc:  # noqa: BLE001
             LOG.warning("Не удалось определить автора сообщения: %s", exc)
+
+        # Уже общается с ботом — мастерам сообщать не нужно, это не новый клиент
+        known.refresh()
+        reason = known.is_known(getattr(sender, "id", None), getattr(sender, "username", None))
+        if reason:
+            stats["known"] += 1
+            LOG.info("Пропуск (%s): %s — %s", reason, sender_name, text[:50])
+            store.add(keys[0])
+            return
+
+        scored = evaluate(text)
+        if scored is None:
+            return
+        score, categories = scored
 
         chat_title = "Неизвестный чат"
         chat_username = None
@@ -670,7 +798,7 @@ async def run_user_mode(settings: Settings) -> int:
             await asyncio.sleep(settings.heartbeat_minutes * 60)
             await notifier.send(
                 f"🫀 Монитор жив. Чатов: {len(resolved)}, найдено: {stats['found']}, "
-                f"пропущено: {stats['skipped']}."
+                f"пропущено: {stats['skipped']}, уже писали боту: {stats['known']}."
             )
 
     heartbeat_task = asyncio.create_task(heartbeat()) if settings.heartbeat_minutes > 0 else None
@@ -680,7 +808,8 @@ async def run_user_mode(settings: Settings) -> int:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
         await client.disconnect()
-        LOG.info("Монитор остановлен. Найдено: %s, пропущено: %s", stats["found"], stats["skipped"])
+        LOG.info("Монитор остановлен. Найдено: %s, пропущено: %s, уже писали боту: %s",
+                 stats["found"], stats["skipped"], stats["known"])
     return 0
 
 
@@ -705,6 +834,9 @@ async def check_mode(settings: Settings) -> int:
             LOG.warning("  не найден: %s (%s)", name, error[:120])
         if not failed:
             LOG.info("Все чаты на месте — можно запускать монитор")
+        known = KnownUsers(settings.known_users_files, settings.ignore_users,
+                           settings.known_users_refresh_minutes)
+        LOG.info("Фильтр «уже писал боту»: %s", known.describe())
         return 0 if resolved else 2
     finally:
         await client.disconnect()

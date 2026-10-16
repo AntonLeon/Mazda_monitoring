@@ -257,6 +257,51 @@ def test_all_chats_mode():
           settings.chats == list(mon.DEFAULT_CHATS), str(settings.chats))
 
 
+def test_known_users_filter():
+    """Люди, которые уже писали боту, мастерам не показываются."""
+    import json
+
+    bot_users = TMP_DIR / "bot_users.json"
+    bot_users.write_text(json.dumps({
+        "120317642": {"username": "AntonLeontyev"},
+        "555": {"username": ""},
+    }), encoding="utf-8")
+    contacts = TMP_DIR / "contacts.json"
+    contacts.write_text(json.dumps([
+        {"user_id": 777, "username": "client_one"},
+        {"user_id": 888, "username": None},
+    ]), encoding="utf-8")
+
+    known = mon.KnownUsers([bot_users, contacts, TMP_DIR / "нет.json"], ["@Manual_User", "-100500"],
+                           refresh_minutes=5)
+    check("id из реестра бота отсекается", known.is_known(120317642) == "уже писал боту")
+    check("юзернейм сопоставляется без учёта регистра и @",
+          known.is_known(1, "@antonleontyev") == "уже писал боту")
+    check("id из заявок отсекается", known.is_known(777) == "уже писал боту")
+    check("юзернейм из заявок отсекается", known.is_known(None, "client_one") == "уже писал боту")
+    check("ручное исключение по id работает", known.is_known(-100500) == "уже писал боту")
+    check("ручное исключение по юзернейму работает", known.is_known(None, "manual_user") == "уже писал боту")
+    check("новый человек проходит фильтр", known.is_known(999999, "newbie") is None)
+    check("пропущенный файл не ломает загрузку", known.is_known(888) == "уже писал боту")
+    check("в описании видно число известных", "известных пользователей" in known.describe(), known.describe())
+
+    empty = mon.KnownUsers([], [], refresh_minutes=0)
+    check("без файлов фильтр никого не отсекает", empty.is_known(1, "anyone") is None)
+    check("без файлов описание корректное", "нет файлов" in empty.describe(), empty.describe())
+
+    session = TMP_DIR / "known.session"
+    session.write_bytes(b"stub")
+    settings = mon.load_settings(env={
+        "MONITOR_API_ID": "1", "MONITOR_API_HASH": "x", "MONITOR_NOTIFY_USERS": "1",
+        "MONITOR_SESSION": str(session.with_suffix("")),
+        "MONITOR_KNOWN_USERS_FILE": f"{bot_users},{contacts}",
+        "MONITOR_IGNORE_USERS": "@boss",
+    })
+    check("пути к файлам читаются из настроек", settings.known_users_files == [bot_users, contacts],
+          str(settings.known_users_files))
+    check("ручные исключения читаются из настроек", settings.ignore_users == ["@boss"], str(settings.ignore_users))
+
+
 def test_dry_run_flag():
     session = TMP_DIR / "dry.session"
     session.write_bytes(b"stub")
@@ -282,6 +327,7 @@ def main() -> int:
         test_seen_store,
         test_chat_targets,
         test_all_chats_mode,
+        test_known_users_filter,
         test_dry_run_flag,
     ):
         print(f"\n--- {test.__name__} ---")
