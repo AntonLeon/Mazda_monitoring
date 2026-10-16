@@ -302,6 +302,76 @@ def test_known_users_filter():
     check("ручные исключения читаются из настроек", settings.ignore_users == ["@boss"], str(settings.ignore_users))
 
 
+def test_relative_paths_from_env_file():
+    """Относительные пути считаются от файла настроек, а не от папки скрипта."""
+    config_dir = TMP_DIR / "cfg"
+    config_dir.mkdir(exist_ok=True)
+    (config_dir / "sess.session").write_bytes(b"stub")
+    (config_dir / "state.json").write_text("{}", encoding="utf-8")
+    env_path = config_dir / "env_rel"
+    env_path.write_text(
+        "MONITOR_API_ID=1\nMONITOR_API_HASH=x\nMONITOR_NOTIFY_USERS=1\n"
+        "MONITOR_SESSION=./sess\nMONITOR_STATE_FILE=state.json\n",
+        encoding="utf-8",
+    )
+    settings = mon.load_settings(explicit_env_file=str(env_path))
+    check("сессия ищется рядом с настройками", settings.session_path == config_dir / "sess",
+          str(settings.session_path))
+    check("файл памяти ищется рядом с настройками", settings.state_file == config_dir / "state.json",
+          str(settings.state_file))
+
+    store = mon.SeenStore(settings.state_file, ttl_hours=24, user_cooldown_hours=168)
+    store.add(f"{mon.USER_KEY_PREFIX}42")
+    check("память читается из того же файла", mon.repeat_reason(store, 42, 168) is not None)
+
+
+def test_one_notification_per_person():
+    """Об одном человеке мастерам сообщаем один раз за кулдаун, а не на каждое сообщение."""
+    path = TMP_DIR / "state_repeat.json"
+    store = mon.SeenStore(path, ttl_hours=24, limit=1000, user_cooldown_hours=168)
+    check("о новом человеке сообщений не было", mon.repeat_reason(store, 555, 168) is None)
+
+    store.add(mon.message_key(-100, 1))
+    store.add(f"{mon.USER_KEY_PREFIX}555")
+    when = mon.repeat_reason(store, 555, 168)
+    check("после уведомления человек считается известным", when is not None)
+    check("в логе понятное время", "назад" in mon.human_delta(when), mon.human_delta(when))
+    check("кулдаун 0 отключает фильтр", mon.repeat_reason(store, 555, 0) is None)
+    check("без id человека фильтр молчит", mon.repeat_reason(store, None, 168) is None)
+
+    # сроки разные: сообщения помним сутки, людей — кулдаун
+    old_store = mon.SeenStore(TMP_DIR / "state_ttl.json", ttl_hours=24, limit=1000,
+                              user_cooldown_hours=168)
+    old_store._data = {
+        "text:1:abc": time.time() - 25 * 3600,
+        f"{mon.USER_KEY_PREFIX}777": time.time() - 25 * 3600,
+        "text:1:def": time.time() - 3600,
+    }
+    old_store._prune()
+    check("старые сообщения вычищаются по суткам", "text:1:abc" not in old_store._data)
+    check("запись о человеке живёт дольше суток",
+          f"{mon.USER_KEY_PREFIX}777" in old_store._data, str(list(old_store._data)))
+    check("свежие сообщения остаются", "text:1:def" in old_store._data)
+
+    removed = store.forget("555")
+    check("--forget забывает человека", removed >= 1 and mon.repeat_reason(store, 555, 168) is None,
+          f"удалено {removed}")
+
+    session = TMP_DIR / "cooldown.session"
+    session.write_bytes(b"stub")
+    settings = mon.load_settings(env={
+        "MONITOR_API_ID": "1", "MONITOR_API_HASH": "x", "MONITOR_NOTIFY_USERS": "1",
+        "MONITOR_SESSION": str(session.with_suffix("")), "MONITOR_USER_COOLDOWN_HOURS": "48",
+    })
+    check("кулдаун читается из настроек", settings.user_cooldown_hours == 48, str(settings.user_cooldown_hours))
+    check("кулдаун виден в описании настроек", "повтор о человеке через 48 ч" in settings.summary(),
+          settings.summary())
+    check("форматирование времени: часы", mon.human_delta(time.time() - 3 * 3600) == "3 ч назад",
+          mon.human_delta(time.time() - 3 * 3600))
+    check("форматирование времени: дни", mon.human_delta(time.time() - 50 * 3600) == "2 дн назад",
+          mon.human_delta(time.time() - 50 * 3600))
+
+
 def test_dry_run_flag():
     session = TMP_DIR / "dry.session"
     session.write_bytes(b"stub")
@@ -328,6 +398,8 @@ def main() -> int:
         test_chat_targets,
         test_all_chats_mode,
         test_known_users_filter,
+        test_relative_paths_from_env_file,
+        test_one_notification_per_person,
         test_dry_run_flag,
     ):
         print(f"\n--- {test.__name__} ---")

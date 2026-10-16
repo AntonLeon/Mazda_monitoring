@@ -58,9 +58,12 @@ DEFAULT_KNOWN_USER_FILES = (
 )
 
 
-def _resolve_path(value: str) -> Path:
+def _resolve_path(value: str, base: Optional[Path] = None) -> Path:
+    """Путь из настроек: абсолютный как есть, относительный — от каталога файла настроек."""
     path = Path(value).expanduser()
-    return path if path.is_absolute() else (BASE_DIR / path)
+    if path.is_absolute():
+        return path
+    return (base or BASE_DIR) / path
 
 
 # ============================== правила поиска клиентов ==============================
@@ -204,6 +207,7 @@ class Settings:
     known_users_files: List[Path] = field(default_factory=list)
     ignore_users: List[str] = field(default_factory=list)
     known_users_refresh_minutes: int = 5
+    user_cooldown_hours: int = 168  # неделя: об одном человеке сообщаем один раз
     bot_token: Optional[str] = None
     min_score: int = 3
     heartbeat_minutes: int = 0
@@ -215,15 +219,21 @@ class Settings:
 
     def summary(self) -> str:
         scope = "все группы аккаунта" if self.all_chats else f"чатов: {len(self.chats)}"
+        cooldown = (f"повтор о человеке через {self.user_cooldown_hours} ч"
+                    if self.user_cooldown_hours else "повторы о человеке разрешены")
         return (
-            f"режим: {self.mode}, {scope}, получателей: {len(self.notify_users)}, "
+            f"режим: {self.mode}, {scope}, получателей: {len(self.notify_users)}, {cooldown}, "
             f"порог веса: {self.min_score}, уведомления: "
             f"{'через бота' if self.bot_token else 'с личного аккаунта'}, настройки: {self.env_file or 'переменные окружения'}"
         )
 
 
-def load_settings(env: Optional[Dict[str, str]] = None, explicit_env_file: Optional[str] = None) -> Settings:
-    """Собрать настройки: файл .env_monitor, поверх — переменные окружения."""
+def load_settings(env: Optional[Dict[str, str]] = None, explicit_env_file: Optional[str] = None,
+                  require_session: bool = True) -> Settings:
+    """Собрать настройки: файл .env_monitor, поверх — переменные окружения.
+
+    require_session=False — для служебных команд (например, --forget), которым Telegram не нужен.
+    """
     values: Dict[str, str] = {}
     env_file: Optional[Path] = None
     if env is None:
@@ -236,6 +246,7 @@ def load_settings(env: Optional[Dict[str, str]] = None, explicit_env_file: Optio
 
     settings = Settings()
     settings.env_file = env_file
+    base_dir = env_file.parent if env_file is not None else BASE_DIR
 
     api_id_raw = (values.get("MONITOR_API_ID") or "").strip()
     api_hash_raw = (values.get("MONITOR_API_HASH") or "").strip()
@@ -245,8 +256,7 @@ def load_settings(env: Optional[Dict[str, str]] = None, explicit_env_file: Optio
 
     session_value = (values.get("MONITOR_SESSION") or "").strip()
     if session_value:
-        path = Path(session_value).expanduser()
-        settings.session_path = path if path.is_absolute() else (BASE_DIR / path)
+        settings.session_path = _resolve_path(session_value, base_dir)
     settings.session_path = settings.session_path.with_suffix("") if settings.session_path.suffix == ".session" \
         else settings.session_path
 
@@ -281,24 +291,24 @@ def load_settings(env: Optional[Dict[str, str]] = None, explicit_env_file: Optio
 
     log_value = (values.get("MONITOR_LOG_FILE") or "").strip()
     if log_value:
-        path = Path(log_value).expanduser()
-        settings.log_file = path if path.is_absolute() else (BASE_DIR / path)
+        settings.log_file = _resolve_path(log_value, base_dir)
 
     state_value = (values.get("MONITOR_STATE_FILE") or "").strip()
     if state_value:
-        path = Path(state_value).expanduser()
-        settings.state_file = path if path.is_absolute() else (BASE_DIR / path)
+        settings.state_file = _resolve_path(state_value, base_dir)
 
     settings.dry_run = (values.get("MONITOR_DRY_RUN", "").strip().lower() in {"1", "true", "yes", "on"})
 
     known = split_list(values.get("MONITOR_KNOWN_USERS_FILE", ""))
     if known:
-        settings.known_users_files = [_resolve_path(item) for item in known]
+        settings.known_users_files = [_resolve_path(item, base_dir) for item in known]
     else:
         settings.known_users_files = [path for path in DEFAULT_KNOWN_USER_FILES if path.exists()]
     settings.ignore_users = split_list(values.get("MONITOR_IGNORE_USERS", ""))
     settings.known_users_refresh_minutes = to_int(
         values.get("MONITOR_KNOWN_USERS_REFRESH", ""), "MONITOR_KNOWN_USERS_REFRESH", default=5)
+    settings.user_cooldown_hours = to_int(
+        values.get("MONITOR_USER_COOLDOWN_HOURS", ""), "MONITOR_USER_COOLDOWN_HOURS", default=168)
 
     # Режим: для личного аккаунта нужны api_id и api_hash, иначе — только бот
     if settings.api_id and settings.api_hash:
@@ -313,7 +323,7 @@ def load_settings(env: Optional[Dict[str, str]] = None, explicit_env_file: Optio
             "  • либо укажите MONITOR_BOT_TOKEN, если мониторить будет бот."
         )
 
-    if settings.mode == "user" and not session_file_exists(settings.session_path):
+    if require_session and settings.mode == "user" and not session_file_exists(settings.session_path):
         raise ConfigError(
             f"Не найден файл сессии {settings.session_path}.\n"
             "  Скопируйте mazda_session.session на сервер (права 600) — без него Telegram "
@@ -392,8 +402,21 @@ def build_notification(*, sender_name: str, text: str, chat_title: str, chat_use
     return "\n".join(lines)
 
 
+USER_KEY_PREFIX = "user:"
+
+
 def message_key(chat_id: int, message_id: int) -> str:
     return f"{chat_id}:{message_id}"
+
+
+def human_delta(timestamp: float, now: Optional[float] = None) -> str:
+    """«меньше часа назад», «5 ч назад», «3 дн назад» — для понятного лога."""
+    hours = max(int(((now or time.time()) - timestamp) // 3600), 0)
+    if hours < 1:
+        return "меньше часа назад"
+    if hours < 24:
+        return f"{hours} ч назад"
+    return f"{hours // 24} дн назад"
 
 
 def text_key(sender_id: Optional[int], text: str) -> str:
@@ -410,9 +433,11 @@ class SeenStore:
     Файл ограничен по количеству записей и времени жизни (по умолчанию сутки).
     """
 
-    def __init__(self, path: Path, ttl_hours: int = 24, limit: int = 5000) -> None:
+    def __init__(self, path: Path, ttl_hours: int = 24, limit: int = 5000,
+                 user_cooldown_hours: int = 168) -> None:
         self.path = path
         self.ttl = max(ttl_hours, 0) * 3600
+        self.user_ttl = max(user_cooldown_hours, 0) * 3600
         self.limit = limit
         self._data: Dict[str, float] = {}
         self._load()
@@ -428,15 +453,33 @@ class SeenStore:
             LOG.warning("Не удалось прочитать %s: %s — начинаю с чистого листа", self.path, exc)
 
     def _prune(self) -> None:
-        if self.ttl:
-            edge = time.time() - self.ttl
-            self._data = {k: v for k, v in self._data.items() if v >= edge}
+        # у записей о людях срок больше: о клиенте сообщаем один раз за кулдаун,
+        # а одинаковые тексты сообщений помним сутки
+        now = time.time()
+        for key, stamp in list(self._data.items()):
+            ttl = self.user_ttl if key.startswith(USER_KEY_PREFIX) else self.ttl
+            if ttl and now - stamp > ttl:
+                self._data.pop(key, None)
         if len(self._data) > self.limit:
             for key, _ in sorted(self._data.items(), key=lambda item: item[1])[: len(self._data) - self.limit]:
                 self._data.pop(key, None)
 
     def seen(self, key: str) -> bool:
         return key in self._data
+
+    def seen_at(self, key: str) -> Optional[float]:
+        """Когда мы в последний раз добавляли эту запись (None — не было)."""
+        return self._data.get(key)
+
+    def forget(self, needle: str) -> int:
+        """Забыть записи про человека: снова сможем о нём сообщить."""
+        needle = needle.strip().lstrip("@")
+        removed = [key for key in self._data if needle in key]
+        for key in removed:
+            self._data.pop(key, None)
+        if removed:
+            self.save()
+        return len(removed)
 
     def add(self, key: str) -> None:
         self._data[key] = time.time()
@@ -454,6 +497,16 @@ class SeenStore:
             os.replace(temp_path, self.path)
         except OSError as exc:
             LOG.warning("Не удалось сохранить %s: %s", self.path, exc)
+
+
+def repeat_reason(store: "SeenStore", sender_id: Optional[int], cooldown_hours: int) -> Optional[float]:
+    """Когда мы уже сообщали об этом человеке (None — не сообщали или кулдаун выключен).
+
+    Логика продаж: о клиенте мастерам сообщают один раз, а не на каждое его сообщение.
+    """
+    if not sender_id or cooldown_hours <= 0:
+        return None
+    return store.seen_at(f"{USER_KEY_PREFIX}{int(sender_id)}")
 
 
 # ============================== те, кто уже писал боту ==============================
@@ -701,12 +754,13 @@ async def run_user_mode(settings: Settings) -> int:
                 "а юзернеймы — быть актуальными (надёжнее указывать числовые id)."
             )
 
-    store = SeenStore(settings.state_file, ttl_hours=settings.seen_hours)
+    store = SeenStore(settings.state_file, ttl_hours=settings.seen_hours,
+                      user_cooldown_hours=settings.user_cooldown_hours)
     notifier = Notifier(settings, client)
     known = KnownUsers(settings.known_users_files, settings.ignore_users,
                        settings.known_users_refresh_minutes)
     LOG.info("Фильтр «уже писал боту»: %s", known.describe())
-    stats = {"found": 0, "skipped": 0, "known": 0}
+    stats = {"found": 0, "skipped": 0, "known": 0, "repeat": 0}
 
     def evaluate(text: str) -> Optional[Tuple[int, List[str]]]:
         """Оценка сообщения: None — не наш случай."""
@@ -760,6 +814,16 @@ async def run_user_mode(settings: Settings) -> int:
             store.add(keys[0])
             return
 
+        # Об этом человеке уже сообщали — второй раз мастеров не дёргаем
+        sender_id = getattr(sender, "id", None)
+        repeat_at = repeat_reason(store, sender_id, settings.user_cooldown_hours)
+        if repeat_at is not None:
+            stats["repeat"] += 1
+            LOG.info("Пропуск (о нём уже сообщали %s): %s — %s",
+                     human_delta(repeat_at), sender_name, text[:50])
+            store.add(keys[0])
+            return
+
         scored = evaluate(text)
         if scored is None:
             return
@@ -784,6 +848,8 @@ async def run_user_mode(settings: Settings) -> int:
             await notifier.send(notification)
         store.add(keys[0])
         store.add(keys[1])
+        if sender_id:
+            store.add(f"{USER_KEY_PREFIX}{int(sender_id)}")  # об этом человеке больше не сообщаем
 
     if settings.all_chats:
         client.add_event_handler(handler, events.NewMessage())
@@ -798,7 +864,8 @@ async def run_user_mode(settings: Settings) -> int:
             await asyncio.sleep(settings.heartbeat_minutes * 60)
             await notifier.send(
                 f"🫀 Монитор жив. Чатов: {len(resolved)}, найдено: {stats['found']}, "
-                f"пропущено: {stats['skipped']}, уже писали боту: {stats['known']}."
+                f"отсеяно: {stats['skipped']}, уже писали боту: {stats['known']}, "
+                f"повторные о человеке: {stats['repeat']}."
             )
 
     heartbeat_task = asyncio.create_task(heartbeat()) if settings.heartbeat_minutes > 0 else None
@@ -808,8 +875,9 @@ async def run_user_mode(settings: Settings) -> int:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
         await client.disconnect()
-        LOG.info("Монитор остановлен. Найдено: %s, пропущено: %s, уже писали боту: %s",
-                 stats["found"], stats["skipped"], stats["known"])
+        LOG.info("Монитор остановлен. Найдено: %s, отсеяно по правилам: %s, уже писали боту: %s, "
+                 "повторные о человеке: %s",
+                 stats["found"], stats["skipped"], stats["known"], stats["repeat"])
     return 0
 
 
@@ -865,16 +933,26 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--check", action="store_true", help="проверить настройки, сессию и чаты, затем выйти")
     parser.add_argument("--env-file", help="путь к файлу настроек (по умолчанию .env_monitor рядом со скриптом)")
     parser.add_argument("--verbose", action="store_true", help="подробный лог")
+    parser.add_argument("--forget", metavar="ID_ИЛИ_ЮЗЕРНЕЙМ",
+                        help="забыть человека: снова сообщать о нём мастерам")
     args = parser.parse_args(argv)
 
     try:
-        settings = load_settings(explicit_env_file=args.env_file)
+        settings = load_settings(explicit_env_file=args.env_file, require_session=not args.forget)
     except ConfigError as exc:
         setup_logging(None)
         LOG.error("%s", exc)
         return 2
 
     setup_logging(settings.log_file, verbose=args.verbose)
+
+    if args.forget:
+        store = SeenStore(settings.state_file, ttl_hours=settings.seen_hours,
+                          user_cooldown_hours=settings.user_cooldown_hours)
+        removed = store.forget(args.forget)
+        LOG.info("Забыто записей про %s: %s", args.forget, removed)
+        return 0
+
     if args.check:
         if settings.mode != "user":
             LOG.info("Режим «%s»: чаты проверяются только в режиме личного аккаунта", settings.mode)
