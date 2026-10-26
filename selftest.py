@@ -443,6 +443,19 @@ def test_dictionary_recall():
     check("шум не превращается в уведомления", not leaked, "; ".join(leaked))
 
 
+def test_flash_drive_words():
+    """Флешка/флэшка — тема услуги: сама по себе тихо, с контекстом — уведомление."""
+    for word in ("флешка", "флэшка", "флешки", "флэшки", "флешку", "флэшкой"):
+        score, categories, veto = mon.score_message(f"речь про {word}")
+        check(f"слово «{word}» в словаре", "флешка/USB" in categories, str(categories))
+    score, _, veto = mon.score_message("Скинул музыку на флешку, всё ок")
+    check("болтовня про флешку не уведомляет", veto is None and score < 3, str(score))
+    score, _, veto = mon.score_message("Флешку не видит магнитола, что делать?")
+    check("проблема с флешкой в магнитоле — уведомление", veto is None and score >= 3, str(score))
+    score, _, veto = mon.score_message("Как обновить карты через флешку?")
+    check("обновление карт через флешку — уведомление", veto is None and score >= 3, str(score))
+
+
 def test_session_lock():
     """Одна сессия — один процесс: иначе Telegram может отозвать ключ."""
     path = TMP_DIR / "test.lock"
@@ -596,6 +609,7 @@ def main() -> int:
         test_known_users_filter,
         test_relative_paths_from_env_file,
         test_session_lock,
+        test_flash_drive_words,
         test_one_notification_per_person,
         test_dictionary_recall,
         test_keywords_file,
