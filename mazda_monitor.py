@@ -1139,7 +1139,7 @@ async def run_user_mode(settings: Settings) -> int:
     cfg = load_keywords()
     LOG.info("Словарь: %s, правил: %s, отсевов: %s", cfg.source, len(cfg.rules), len(cfg.veto))
     LOG.info("Фильтр «уже писал боту»: %s", known.describe())
-    stats = {"found": 0, "skipped": 0, "known": 0, "repeat": 0}
+    stats = {"seen": 0, "found": 0, "skipped": 0, "known": 0, "repeat": 0}
 
     log = CandidateLog(settings.log_csv)
     report_state = ReportState(settings.report_state)
@@ -1156,8 +1156,12 @@ async def run_user_mode(settings: Settings) -> int:
             if abs(int(getattr(message, "chat_id", 0))) in excluded:
                 return
         text = (message.text or "").strip()
+        stats["seen"] += 1
+        if stats["seen"] % 100 == 0:
+            LOG.info("Перехвачено сообщений: %s", stats["seen"])
         if len(text) < 10:
             return
+        LOG.debug("Сообщение (чат %s): %s", getattr(message, "chat_id", "?"), text[:60])
 
         keys = (message_key(message.chat_id, message.id), text_key(getattr(event, "sender_id", None), text))
         if store.seen(keys[0]) or store.seen(keys[1]):
@@ -1260,7 +1264,8 @@ async def run_user_mode(settings: Settings) -> int:
         while True:
             await asyncio.sleep(settings.heartbeat_minutes * 60)
             await notifier.send(
-                f"🫀 Монитор жив. Чатов: {len(resolved)}, найдено: {stats['found']}, "
+                f"🫀 Монитор жив. Чатов: {len(resolved)}, перехвачено: {stats['seen']}, "
+                f"найдено: {stats['found']}, "
                 f"отсеяно: {stats['skipped']}, уже писали боту: {stats['known']}, "
                 f"повторные о человеке: {stats['repeat']}."
             )
@@ -1288,9 +1293,10 @@ async def run_user_mode(settings: Settings) -> int:
         if report_task is not None:
             report_task.cancel()
         await client.disconnect()
-        LOG.info("Монитор остановлен. Найдено: %s, отсеяно по правилам: %s, уже писали боту: %s, "
+        LOG.info("Монитор остановлен. Перехвачено: %s, найдено: %s, отсеяно по правилам: %s, "
+                 "уже писали боту: %s, "
                  "повторные о человеке: %s",
-                 stats["found"], stats["skipped"], stats["known"], stats["repeat"])
+                 stats["seen"], stats["found"], stats["skipped"], stats["known"], stats["repeat"])
     return 0
 
 
