@@ -93,7 +93,7 @@ def test_env_parsing():
     path.write_text(
         "# комментарий\n"
         "MONITOR_API_ID=\"12345\"\n"
-        "export MONITOR_API_HASH='abcdef0123456789abcdef0123456789'\n"
+        "export MONITOR_API_HASH='test-api-hash-not-real'\n"
         "MONITOR_NOTIFY_USERS= 120317642 , 1882208554 ,, \n"
         "MONITOR_CHATS=@mazdachinacx5, t.me/mazda_club_cx5\n"
         "; ещё комментарий\n",
@@ -101,7 +101,7 @@ def test_env_parsing():
     )
     values = mon.read_env_file(path)
     check("кавычки убираются", values["MONITOR_API_ID"] == "12345", values.get("MONITOR_API_ID", ""))
-    check("export разбирается", values["MONITOR_API_HASH"].startswith("abcdef01"))
+    check("export разбирается", values["MONITOR_API_HASH"] == "test-api-hash-not-real")
     check("список получателей чистится",
           mon.split_list(values["MONITOR_NOTIFY_USERS"]) == ["120317642", "1882208554"],
           str(mon.split_list(values["MONITOR_NOTIFY_USERS"])))
@@ -136,7 +136,7 @@ def test_settings_ok():
     session.write_bytes(b"stub")
     settings = mon.load_settings(env={
         "MONITOR_API_ID": "12345",
-        "MONITOR_API_HASH": "abcdef0123456789abcdef0123456789",
+        "MONITOR_API_HASH": "test-api-hash-not-real",
         "MONITOR_NOTIFY_USERS": "120317642,@master",
         "MONITOR_SESSION": str(session.with_suffix("")),
         "MONITOR_MIN_SCORE": "4",
@@ -150,7 +150,7 @@ def test_settings_ok():
 
     bot_settings = mon.load_settings(env={
         "MONITOR_NOTIFY_USERS": "120317642",
-        "MONITOR_BOT_TOKEN": "123456:AAHdqTcvCH1vGWJxfSeofSAs0K5PALDsaw",
+        "MONITOR_BOT_TOKEN": "000000000:TEST-TOKEN-NOT-REAL",
     })
     check("без api_id, но с токеном бота — режим bot", bot_settings.mode == "bot", bot_settings.mode)
 
