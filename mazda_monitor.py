@@ -87,7 +87,8 @@ class Rule:
 
 DEFAULT_RULE_DEFS: Tuple[Tuple[str, int, Tuple[str, ...]], ...] = (
     ("купил/забрал машину", 3, (
-        r"\b(купил[аи]?|приобр[её]л[аи]?|забрал[аи]?|забираю|заберу|взял[аи]?|пригнал[аи]?|"
+        r"\b(купил[аи]?|приобр[её]л[аи]?|забрал[аи]?|забираю|заберу|"
+        r"взял[аи]?\s+(машину|авто|мазд\w*|сх[- ]?5|cx[- ]?5)|пригнал[аи]?|"
         r"приехала|машина пришла|пришла машина|жду машину|заказал[аи]? машину|еду забирать|"
         r"в пути|на подходе|фура|контейнер|порт[уа]?|владивосток|оформляю|пересел)\b",)),
     ("таможня/доставка", 3, (
@@ -201,7 +202,7 @@ DEFAULT_REPLY = ("Здравствуйте! Я мастер по CX-5 из Ки�
                  "Напишите год машины и что нужно — подскажу по цене и срокам.")
 
 KEYWORDS_FILE = BASE_DIR / "keywords.json"
-KEYWORDS_VERSION = 3
+KEYWORDS_VERSION = 4
 
 
 @dataclass
@@ -998,6 +999,7 @@ class Notifier:
         self.settings = settings
         self.client = client
         self.sent = 0
+        self._dialogs_loaded = False
 
     async def send(self, text: str) -> int:
         delivered = 0
@@ -1014,19 +1016,87 @@ class Notifier:
                 LOG.error("Не удалось отправить %s: %s", target, exc)
         return delivered
 
+    async def _resolve_target(self, target: str):
+        """Кому отправить: юзернейм, id или уже известная сущность.
+
+        Отправка «в никуда» по числовому id не работает: Telethon не знает access_hash,
+        пока не увидит диалог. Поэтому при первом промахе один раз загружаем диалоги
+        (кэш сущностей) и пробуем снова.
+        """
+        value = str(target).strip()
+        if not value.lstrip("-").isdigit():
+            return await self.client.get_entity(value)
+        try:
+            return await self.client.get_entity(int(value))
+        except Exception as exc:  # noqa: BLE001 — пробуем после загрузки диалогов
+            LOG.debug("Получатель %s не найден в кэше (%s) — загружаю диалоги", value, exc)
+            if not self._dialogs_loaded:
+                try:
+                    await self.client.get_dialogs(limit=None)
+                    self._dialogs_loaded = True
+                except Exception as dialogs_exc:  # noqa: BLE001
+                    LOG.warning("Не удалось загрузить диалоги аккаунта: %s", dialogs_exc)
+            return await self.client.get_entity(int(value))
+
     async def _send_from_account(self, target: str, text: str) -> None:
         from telethon.errors import FloodWaitError  # импорт здесь: без telethon модуль импортируется для тестов
 
+        entity = await self._resolve_target(target)
         try:
-            await self.client.send_message(target, text)
+            await self.client.send_message(entity, text)
         except FloodWaitError as exc:
             wait = int(getattr(exc, "seconds", 60)) + 5
             LOG.warning("Telegram просит подождать %s с (лимит отправки) — жду и повторяю", wait)
             await asyncio.sleep(wait)
-            await self.client.send_message(target, text)
+            await self.client.send_message(entity, text)
 
 
 # ============================== работа с Telegram ==============================
+
+
+class MonitorLock:
+    """Блокировка файла сессии: второй процесс не должен подключаться тем же аккаунтом.
+
+    Telegram может отозвать ключ, если одна сессия используется из двух мест одновременно,
+    поэтому мониторинг и --check не должны работать параллельно.
+    """
+
+    def __init__(self, path: Path) -> None:
+        self.path = Path(path)
+        self._handle = None
+
+    def acquire(self) -> bool:
+        try:
+            import fcntl
+        except ImportError:  # не Unix — блокировки нет, работаем как раньше
+            return True
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._handle = open(self.path, "w", encoding="utf-8")
+            try:
+                fcntl.flock(self._handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError:
+                self._handle.close()
+                self._handle = None
+                return False
+            self._handle.write(str(os.getpid()))
+            self._handle.flush()
+            try:
+                os.chmod(self.path, 0o600)
+            except OSError:
+                pass
+            return True
+        except OSError as exc:
+            LOG.warning("Не удалось создать блокировку %s: %s", self.path, exc)
+            return True  # не мешаем работе из-за проблем с файлом блокировки
+
+    def release(self) -> None:
+        if self._handle is not None:
+            try:
+                self._handle.close()
+            except OSError:
+                pass
+            self._handle = None
 
 
 def session_file_exists(path: Path) -> bool:
@@ -1101,6 +1171,13 @@ async def run_user_mode(settings: Settings) -> int:
     from telethon import TelegramClient, events
 
     ensure_session_permissions(settings.session_path)
+    lock = MonitorLock(settings.session_path.with_suffix(".lock"))
+    if not lock.acquire():
+        raise ConfigError(
+            "Монитор уже запущен (файл сессии занят). Остановите службу перед повторным запуском: "
+            "systemctl stop mazda-monitor"
+        )
+
     client = TelegramClient(str(settings.session_path), settings.api_id, settings.api_hash)
     await client.connect()
     if not await client.is_user_authorized():
@@ -1139,7 +1216,7 @@ async def run_user_mode(settings: Settings) -> int:
     cfg = load_keywords()
     LOG.info("Словарь: %s, правил: %s, отсевов: %s", cfg.source, len(cfg.rules), len(cfg.veto))
     LOG.info("Фильтр «уже писал боту»: %s", known.describe())
-    stats = {"seen": 0, "found": 0, "skipped": 0, "known": 0, "repeat": 0}
+    stats = {"seen": 0, "found": 0, "skipped": 0, "known": 0, "repeat": 0, "undelivered": 0}
 
     log = CandidateLog(settings.log_csv)
     report_state = ReportState(settings.report_state)
@@ -1243,10 +1320,18 @@ async def run_user_mode(settings: Settings) -> int:
         if settings.dry_run:
             LOG.info("[проверка] уведомление не отправлено:\n%s", notification)
             log_row("skipped", "проверка (dry-run)", score, categories)
-        else:
-            delivered = await notifier.send(notification)
-            log_row("notified" if delivered else "skipped",
-                    "отправлено" if delivered else "не доставлено", score, categories)
+            return  # в проверке ничего не помечаем
+
+        delivered = await notifier.send(notification)
+        if not delivered:
+            # Не помечаем лид: иначе он «сгорит» на неделю, так и не дойдя до мастера
+            stats["undelivered"] += 1
+            log_row("skipped", "не доставлено", score, categories)
+            LOG.error("Уведомление не дошло до получателей — лид не помечаю, "
+                      "повторю при следующем сообщении от этого человека")
+            return
+
+        log_row("notified", "отправлено", score, categories)
         store.add(keys[0])
         store.add(keys[1])
         if sender_id:
@@ -1294,9 +1379,10 @@ async def run_user_mode(settings: Settings) -> int:
             report_task.cancel()
         await client.disconnect()
         LOG.info("Монитор остановлен. Перехвачено: %s, найдено: %s, отсеяно по правилам: %s, "
-                 "уже писали боту: %s, "
+                 "не доставлено: %s, уже писали боту: %s, "
                  "повторные о человеке: %s",
-                 stats["seen"], stats["found"], stats["skipped"], stats["known"], stats["repeat"])
+                 stats["seen"], stats["found"], stats["skipped"], stats["undelivered"],
+                 stats["known"], stats["repeat"])
     return 0
 
 
@@ -1306,6 +1392,12 @@ async def check_mode(settings: Settings) -> int:
 
     LOG.info("Настройки: %s", settings.summary())
     ensure_session_permissions(settings.session_path)
+    lock = MonitorLock(settings.session_path.with_suffix(".lock"))
+    if not lock.acquire():
+        LOG.error("Монитор сейчас работает — проверка откроет вторую сессию и может сбить ключ. "
+                  "Остановите службу: systemctl stop mazda-monitor, затем повторите --check")
+        return 3
+
     client = TelegramClient(str(settings.session_path), settings.api_id, settings.api_hash)
     await client.connect()
     try:

@@ -438,6 +438,20 @@ def test_dictionary_recall():
     check("шум не превращается в уведомления", not leaked, "; ".join(leaked))
 
 
+def test_session_lock():
+    """Одна сессия — один процесс: иначе Telegram может отозвать ключ."""
+    path = TMP_DIR / "test.lock"
+    first = mon.MonitorLock(path)
+    check("блокировка берётся первым процессом", first.acquire() is True)
+    second = mon.MonitorLock(path)
+    check("второй процесс не пускается", second.acquire() is False)
+    first.release()
+    third = mon.MonitorLock(path)
+    check("после освобождения пускается снова", third.acquire() is True)
+    third.release()
+    check("файл блокировки не содержит чужих данных", path.read_text(encoding="utf-8").strip().isdigit())
+
+
 def test_keywords_file():
     """Словарь живёт в keywords.json: создаётся сам, правится без кода, битое не роняет."""
     folder = TMP_DIR / "kw"
@@ -576,6 +590,7 @@ def main() -> int:
         test_all_chats_mode,
         test_known_users_filter,
         test_relative_paths_from_env_file,
+        test_session_lock,
         test_one_notification_per_person,
         test_dictionary_recall,
         test_keywords_file,
