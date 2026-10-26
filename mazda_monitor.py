@@ -789,6 +789,11 @@ class CandidateLog:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             is_new = not self.path.exists() or self.path.stat().st_size == 0
             with self.path.open("a", encoding="utf-8", newline="") as handle:
+                if is_new:
+                    try:
+                        os.chmod(self.path, 0o600)  # там переписка и юзернеймы клиентов
+                    except OSError:
+                        pass
                 writer = csv.writer(handle)
                 if is_new:
                     writer.writerow(CSV_HEADER)
