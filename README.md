@@ -181,6 +181,8 @@ MONITOR_CHATS_EXCLUDE=@mazda_masters,-1001234567890
 ```bash
 python3 selftest.py                  # 51 проверка, офлайн, без сети и без telethon
 ./venv/bin/python mazda_monitor.py --check    # настройки, сессия, чаты
+# --check запускайте при остановленной службе: при работающем мониторе он сам откажется,
+# чтобы не открывать вторую сессию тем же аккаунтом (Telegram может отозвать ключ).
 MONITOR_DRY_RUN=1 ./venv/bin/python mazda_monitor.py   # посмотреть, что попадает в уведомления
 ```
 
