@@ -1309,6 +1309,21 @@ async def check_mode(settings: Settings) -> int:
         me = await client.get_me()
         LOG.info("Аккаунт: %s (id %s, @%s)", getattr(me, "first_name", "?"), getattr(me, "id", "?"),
                  getattr(me, "username", "нет"))
+
+        if settings.all_chats:
+            groups = await list_account_groups(client)
+            excluded = await resolve_excluded(client, settings.chats_exclude)
+            LOG.info("Групп и каналов у аккаунта: %s (исключено: %s)", len(groups), len(excluded))
+            for entity in groups[:25]:
+                LOG.info("  • %s", getattr(entity, "title", "?") or getattr(entity, "username", "?"))
+            if len(groups) > 25:
+                LOG.info("  … и ещё %s", len(groups) - 25)
+            if not groups:
+                LOG.error("Аккаунт не состоит ни в одной группе — слушать нечего, монитор не запустится")
+                return 2
+            LOG.info("Можно запускать монитор: слушает все группы аккаунта")
+            return 0
+
         resolved, failed = await resolve_chats(client, settings.chats)
         LOG.info("Чатов подключено: %s из %s", len(resolved), len(settings.chats))
         for name, error in failed:
