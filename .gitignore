@@ -4,6 +4,10 @@
 *.session
 *.session-journal
 monitor_state.json
+monitor_report_state.json
+monitor_candidates.csv
+keywords.json
+keywords.json.bak
 monitor.log
 *.log
 

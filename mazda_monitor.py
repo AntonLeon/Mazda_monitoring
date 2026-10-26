@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import csv
 import difflib
 import hashlib
 import json
@@ -67,9 +68,14 @@ def _resolve_path(value: str, base: Optional[Path] = None) -> Path:
 
 
 # ============================== правила поиска клиентов ==============================
-# score — вес категории; чем выше, тем интереснее сообщение.
-# Отрицательные веса снижают итог, веса <= -50 означают «не уведомлять никогда»
-# (продавцы, реклама, вакансии): иначе мастер тонет в чужих объявлениях.
+# Словарь лежит в keywords.json рядом со скриптом: его можно править без правки кода.
+# При первом запуске файл создаётся сам из значений ниже. Формат:
+#   {"rules": [{"category": "...", "weight": 3, "patterns": ["регулярка", ...]}, ...],
+#    "veto":  [{"category": "...", "weight": -99, "patterns": [...]}, ...],
+#    "fuzzy": {"русификация": [4, "русификация"]}, "fuzzy_ratio": 0.8,
+#    "replies": {"русификация": "Здравствуйте! ..."}}
+# Веса: чем выше, тем интереснее сообщение. Вес <= -50 — не уведомлять никогда.
+# Монитор НИКОГДА не пишет в чаты и не отвечает клиентам — только уведомляет мастеров.
 
 
 @dataclass(frozen=True)
@@ -79,48 +85,83 @@ class Rule:
     pattern: "re.Pattern[str]"
 
 
-RULES: Tuple[Rule, ...] = (
-    Rule("купил/забрал машину", 3, re.compile(
-        r"\b(купил[аи]?|приобр[её]л[аи]?|забрал[аи]?|забираю|взял[аи]?|пригнал[аи]?|"
-        r"машина пришла|пришла машина|жду машину|заказал[аи]? машину)\b", re.I)),
-    Rule("таможня/доставка", 3, re.compile(
-        r"\b(таможн\w*|растамож\w*|деклараци\w*|на границе|на стоянке|стоянк\w+|"
-        r"сбктс|эптс|лаборатори\w*|брокер\w*)\b", re.I)),
-    Rule("новый владелец", 2, re.compile(
-        r"\b(стал[аи]? владельц\w+|новый владелец|только купил[аи]?|первый автомобиль|первая машина)\b", re.I)),
-    Rule("машина из Китая", 1, re.compile(
-        r"\b(из китая|китайск\w+|китаец|china|cn[- ]?верси\w*)\b", re.I)),
-    Rule("русификация", 4, re.compile(
-        r"\b(русификац\w*|руссификац\w*|русский язык|перевод меню|язык меню|локализаци\w*)\b", re.I)),
-    Rule("скрытые функции", 3, re.compile(
-        r"\b(скрыт\w+ (опци\w+|меню|функци\w+)|активир\w+|разблокир\w+|включить скрыт\w+)\b", re.I)),
-    Rule("просьба о помощи", 3, re.compile(
-        r"\b(помогите|подскажите|не могу найти|как настроить|как включить|как активировать|что делать)\b", re.I)),
-    Rule("доработки", 2, re.compile(
-        r"\b(антикор\w*|сигналк\w*|сигнализаци\w*|пленк\w*|бронепленк\w*|шумк\w*|"
-        r"полировк\w*|керамик\w*|автозапуск\w*)\b", re.I)),
-    Rule("вопрос о цене", 1, re.compile(
-        r"\b(сколько стоит|поч[её]м|цена|цены|стоимость|прайс)\b", re.I)),
+DEFAULT_RULE_DEFS: Tuple[Tuple[str, int, Tuple[str, ...]], ...] = (
+    ("купил/забрал машину", 3, (
+        r"\b(купил[аи]?|приобр[её]л[аи]?|забрал[аи]?|забираю|заберу|взял[аи]?|пригнал[аи]?|"
+        r"приехала|машина пришла|пришла машина|жду машину|заказал[аи]? машину|еду забирать|"
+        r"в пути|на подходе|фура|контейнер|порт[уа]?|владивосток|оформляю|пересел)\b",)),
+    ("таможня/доставка", 3, (
+        r"\b(таможн\w*|растамож\w*|деклараци\w*|выпуск\w*|на границе|на стоянке|стоянк\w+|"
+        r"сбктс|эптс|лаборатори\w*|брокер\w*|утильсбор\w*)\b",)),
+    ("русификация", 4, (
+        r"\b(русификац\w*|руссификац\w*|руссификац\w*|русский язык|перевод меню|перевести меню|"
+        r"меню на китайском|проблемы с языком|язык меню|локализаци\w*|на китайском|по-русски|"
+        r"перевести|язык не переключа\w*)\b",)),
+    ("скрытые функции", 3, (
+        r"\b(скрыт\w+ (опци\w+|меню|функци\w+)|активаци\w*|активир\w+|активиров\w*|разблокир\w+|"
+        r"включить скрыт\w+|i-stop|автозапуск\w*)\b",)),
+    ("просьба о помощи", 3, (
+        r"\b(помогите|подскажите|подскажите пожалуйста|не могу найти|как настроить|как включить|"
+        r"как активировать|как перевести|что делать|нужна помощь)\b",)),
+    ("сервисный интент", 2, (
+        r"\b(где сделать|где активировать|где русифицировать|где можно|кто делает|кто занимается|"
+        r"кто может|ищу мастера|ищу специалиста|есть контакты|посоветуйте|порекомендуйте|"
+        r"к кому обратиться|кому отдать|кто в теме|подскажите мастера)\b",)),
+    ("новый владелец", 2, (
+        r"\b(стал[аи]? владельц\w+|новый владелец|только купил[аи]?|первый автомобиль|первая машина)\b",)),
+    ("доработки", 2, (
+        r"\b(антикор\w*|сигналк\w*|сигнализаци\w*|пленк\w*|бронепленк\w*|шумк\w*|полировк\w*|"
+        r"керамик\w*|автозапуск\w*|тонировк\w*|защита радиатора|химчистк\w*)\b",)),
+    ("модель Mazda CX-5", 1, (
+        r"\b(cx[- ]?5|сх[- ]?5|cx5|сх5|мазда\s?сх5|mazda\s?cx[- ]?5)\b",)),
+    ("машина из Китая", 1, (
+        r"\b(из китая|китайск\w+|китаец|china|cn[- ]?верси\w*)\b",)),
+    ("вопрос о цене", 1, (
+        r"\b(сколько стоит|сколько будет|поч[её]м|цена|цены|стоимость|прайс|во сколько встанет)\b",)),
 )
 
-VETO_RULES: Tuple[Rule, ...] = (
-    Rule("продажа/реклама", -99, re.compile(
+DEFAULT_VETO_DEFS: Tuple[Tuple[str, int, Tuple[str, ...]], ...] = (
+    ("продажа/реклама", -99, (
         r"\b(продам|продаю|прода[её]тся|продажа|в наличии|оптом|под заказ|на заказ|скидк\w*|"
         r"акци\w*|рассрочк\w*|выгодн\w+ предложени\w*|звоните|пишите в личку|whatsapp|ватсап|"
-        r"подписывайтесь|реклама|барахолк\w*|магазин|доставка по россии)\b", re.I)),
-    Rule("поиск работы/вакансия", -99, re.compile(
-        r"\b(ищу работу|ваканси\w*|резюме|требуется (мастер|сотрудник|специалист)|нанимаю|подработка)\b", re.I)),
-    Rule("отказ от покупки", -5, re.compile(
-        r"\b(не купил[аи]?|не взял[аи]?|не забрал[аи]?|передумал[аи]?|отказал\w*ся|отказал\w*ась)\b", re.I)),
+        r"подписывайтесь|реклама|барахолк\w*|магазин|доставка по россии|аренда|прокат|сдаю|сда[её]тся)\b",)),
+    ("поиск работы/вакансия", -99, (
+        r"\b(ищу работу|ваканси\w*|резюме|требуется (мастер|сотрудник|специалист)|нанимаю|подработка)\b",)),
+    ("покупка авто, а не услуга", -99, (
+        r"\b((куплю|ищу|подбираю)\s+(авто|машину|мазду|сх5|cx5)|подбор авто)\b",)),
+    ("отказ от покупки", -5, (
+        r"\b(не купил[аи]?|не взял[аи]?|не забрал[аи]?|передумал[аи]?|отказал\w*ся|отказал\w*ась)\b",)),
 )
+
+
+def compile_rules(defs: Sequence[Tuple[str, int, Sequence[str]]]) -> List[Rule]:
+    """Собрать правила; кривая регулярка не должна ронять монитор."""
+    rules: List[Rule] = []
+    for category, weight, patterns in defs:
+        if isinstance(patterns, str):
+            patterns = [patterns]
+        for pattern in patterns:
+            if not isinstance(pattern, str) or not pattern.strip():
+                continue  # случайно попавшие в список флаги/числа не должны становиться правилом
+            try:
+                rules.append(Rule(str(category), int(weight), re.compile(pattern, re.I)))
+            except re.error as exc:
+                LOG.error("Регулярка категории %r пропущена: %s", category, exc)
+    return rules
+
+
+RULES: Tuple[Rule, ...] = tuple(compile_rules(DEFAULT_RULE_DEFS))
+VETO_RULES: Tuple[Rule, ...] = tuple(compile_rules(DEFAULT_VETO_DEFS))
 
 # Опечатки: клиенты пишут «русификацыя», «антекор», «таможня» через «ж» и т.п.
 FUZZY_KEYWORDS: Dict[str, Tuple[int, str]] = {
     "русификация": (4, "русификация"),
     "руссификация": (4, "русификация"),
     "локализация": (4, "русификация"),
+    "активация": (3, "скрытые функции"),
     "антикор": (2, "доработки"),
     "сигнализация": (2, "доработки"),
+    "автозапуск": (2, "доработки"),
     "таможня": (3, "таможня/доставка"),
     "лаборатория": (3, "таможня/доставка"),
 }
@@ -128,6 +169,170 @@ FUZZY_KEYWORDS: Dict[str, Tuple[int, str]] = {
 # (0.818) проходят, а чужие слова «классификация→русификация» (0.750),
 # «легализация→локализация» (0.818, но другие первые буквы) — нет.
 FUZZY_RATIO = 0.80
+
+# Готовые ответы: их видит мастер в уведомлении и отправляет сам (монитор в чаты не пишет).
+REPLY_TEMPLATES: Dict[str, str] = {
+    "русификация": "Здравствуйте! Русификация панели и меню на CX-5 из Китая — 35 000 ₽, "
+                   "делаем за один день: русский язык, голосовое управление. Напишите город — "
+                   "назову ближайшее свободное окно.",
+    "купил/забрал машину": "Здравствуйте! Поздравляю с машиной. На CX-5 из Китая в первую очередь "
+                           "обычно нужны русификация и активация скрытых опций. Напишите год и город — "
+                           "подскажу, что доступно на вашей машине и когда можем принять.",
+    "таможня/доставка": "Здравствуйте! Пока машина на таможне, можно записаться заранее: приедете — "
+                        "сразу сделаем русификацию и активацию. В каком городе будете получать?",
+    "скрытые функции": "Здравствуйте! Активация скрытых опций на CX-5 — 35 000 ₽ за любое количество. "
+                       "Напишите год и комплектацию — скажу, что доступно именно на вашей машине.",
+    "доработки": "Здравствуйте! По антикору и другим доработкам — подскажите город и модель, "
+                 "назову цену и ближайшее окно.",
+    "новый владелец": "Здравствуйте! С новым авто! Подскажу, что обычно делают первым делом на CX-5 "
+                      "из Китая: русификация и активация скрытых опций. Напишите город и год — сориентирую по цене.",
+}
+DEFAULT_REPLY = ("Здравствуйте! Я мастер по CX-5 из Китая — русификация и активация скрытых опций. "
+                 "Напишите год машины и что нужно — подскажу по цене и срокам.")
+
+KEYWORDS_FILE = BASE_DIR / "keywords.json"
+KEYWORDS_VERSION = 2
+
+
+@dataclass
+class KeywordConfig:
+    """Скомпилированный словарь: правила, отсевы, опечатки и готовые ответы."""
+
+    rules: List[Rule]
+    veto: List[Rule]
+    fuzzy: Dict[str, Tuple[int, str]]
+    fuzzy_ratio: float
+    replies: Dict[str, str]
+    source: str = "встроенный"
+
+
+def default_keywords() -> Dict[str, object]:
+    """Словарь по умолчанию — то, что записывается в keywords.json при первом запуске."""
+    return {
+        "version": KEYWORDS_VERSION,
+        "rules": [{"category": category, "weight": weight, "patterns": list(patterns)}
+                  for category, weight, patterns in DEFAULT_RULE_DEFS],
+        "veto": [{"category": category, "weight": weight, "patterns": list(patterns)}
+                 for category, weight, patterns in DEFAULT_VETO_DEFS],
+        "fuzzy": {word: [score, category] for word, (score, category) in FUZZY_KEYWORDS.items()},
+        "fuzzy_ratio": FUZZY_RATIO,
+        "replies": dict(REPLY_TEMPLATES),
+    }
+
+
+def _compile_keywords(raw: Dict[str, object], source: str) -> KeywordConfig:
+    def defs(key: str) -> List[Tuple[str, int, Sequence[str]]]:
+        result: List[Tuple[str, int, Sequence[str]]] = []
+        for item in raw.get(key) or []:  # type: ignore[union-attr]
+            if not isinstance(item, dict):
+                continue
+            patterns = item.get("patterns") or []
+            if isinstance(patterns, str):
+                patterns = [patterns]
+            # только строки: случайно попавшие в файл числа не должны стать правилом
+            patterns = [pattern for pattern in patterns if isinstance(pattern, str) and pattern.strip()]
+            if not patterns:
+                continue
+            result.append((str(item.get("category", "без категории")), int(item.get("weight", 0) or 0),
+                           patterns))
+        return result
+
+    rules = compile_rules(defs("rules")) or list(RULES)
+    veto = compile_rules(defs("veto")) or list(VETO_RULES)
+
+    fuzzy: Dict[str, Tuple[int, str]] = {}
+    for word, value in (raw.get("fuzzy") or {}).items():  # type: ignore[union-attr]
+        if isinstance(value, (list, tuple)) and len(value) == 2:
+            fuzzy[str(word)] = (int(value[0]), str(value[1]))
+    fuzzy = fuzzy or dict(FUZZY_KEYWORDS)
+
+    replies = {str(key): str(value) for key, value in (raw.get("replies") or {}).items()  # type: ignore[union-attr]
+               if isinstance(value, str) and value.strip()}
+    return KeywordConfig(rules=rules, veto=veto, fuzzy=fuzzy,
+                         fuzzy_ratio=float(raw.get("fuzzy_ratio") or FUZZY_RATIO),
+                         replies=replies or dict(REPLY_TEMPLATES), source=source)
+
+
+_KEYWORDS_CACHE: Optional[KeywordConfig] = None
+_KEYWORDS_STAMP: Tuple[int, float] = (-1, 0.0)
+
+
+def load_keywords(path: Optional[Path] = None, force: bool = False) -> KeywordConfig:
+    """Загрузить словарь из keywords.json.
+
+    Файла нет — создаём из значений по умолчанию и работаем. Файл правили — перечитываем
+    автоматически (проверяется время изменения, перезапуск не нужен).
+    """
+    global _KEYWORDS_CACHE, _KEYWORDS_STAMP
+    target = Path(path) if path is not None else KEYWORDS_FILE
+    try:
+        stamp = (target.stat().st_mtime_ns, target.stat().st_size) if target.exists() else (-1, 0.0)
+    except OSError:
+        stamp = (-1, 0.0)
+
+    if not force and _KEYWORDS_CACHE is not None and stamp == _KEYWORDS_STAMP:
+        return _KEYWORDS_CACHE
+
+    if not target.exists():
+        data = default_keywords()
+        if _atomic_write_json(target, data):
+            LOG.info("Создан словарь %s — слова можно править прямо в нём", target.name)
+        _KEYWORDS_CACHE = _compile_keywords(data, source=f"{target.name} (создан)")
+        _KEYWORDS_STAMP = stamp
+        return _KEYWORDS_CACHE
+
+    try:
+        raw = json.loads(target.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("ожидался объект")
+        if int(raw.get("version") or 0) != KEYWORDS_VERSION:
+            # словарь от старой версии: сохраняем копию и создаём новый (там могли быть
+            # сломанные правила), свои слова потом можно перенести из .bak
+            backup = target.with_suffix(".json.bak")
+            try:
+                target.replace(backup)
+            except OSError:
+                pass
+            LOG.warning("Словарь %s старой версии — создан заново (копия: %s)", target.name, backup.name)
+            data = default_keywords()
+            _atomic_write_json(target, data)
+            _KEYWORDS_CACHE = _compile_keywords(data, source=f"{target.name} (обновлён)")
+            _KEYWORDS_STAMP = (-1, 0.0)
+            return _KEYWORDS_CACHE
+    except (OSError, ValueError) as exc:
+        LOG.error("Словарь %s не прочитан (%s) — работаю со встроенным", target, exc)
+        _KEYWORDS_CACHE = KeywordConfig(list(RULES), list(VETO_RULES), dict(FUZZY_KEYWORDS),
+                                        FUZZY_RATIO, dict(REPLY_TEMPLATES), source="встроенный")
+        _KEYWORDS_STAMP = stamp
+        return _KEYWORDS_CACHE
+
+    _KEYWORDS_CACHE = _compile_keywords(raw, source=target.name)
+    _KEYWORDS_STAMP = stamp
+    return _KEYWORDS_CACHE
+
+
+def _atomic_write_json(path: Path, payload: object) -> bool:
+    """Записать JSON атомарно (временный файл + os.replace) с правами 600."""
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".tmp-", suffix=".json")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as handle:
+                json.dump(payload, handle, ensure_ascii=False, indent=2)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(tmp_name, path)
+        except BaseException:
+            try:
+                os.unlink(tmp_name)
+            except OSError:
+                pass
+            raise
+        os.chmod(path, 0o600)
+        return True
+    except Exception as exc:  # noqa: BLE001
+        LOG.error("Не удалось записать %s: %s", path, exc)
+        return False
 
 
 # ============================== настройки ==============================
@@ -208,6 +413,10 @@ class Settings:
     ignore_users: List[str] = field(default_factory=list)
     known_users_refresh_minutes: int = 5
     user_cooldown_hours: int = 168  # неделя: об одном человеке сообщаем один раз
+    log_csv: Path = field(default_factory=lambda: BASE_DIR / "monitor_candidates.csv")
+    daily_limit: int = 0  # 0 — без лимита уведомлений в сутки
+    report_hour: int = 9  # час дневного отчёта (0-23), -1 — не присылать
+    report_state: Path = field(default_factory=lambda: BASE_DIR / "monitor_report_state.json")
     bot_token: Optional[str] = None
     min_score: int = 3
     heartbeat_minutes: int = 0
@@ -221,8 +430,11 @@ class Settings:
         scope = "все группы аккаунта" if self.all_chats else f"чатов: {len(self.chats)}"
         cooldown = (f"повтор о человеке через {self.user_cooldown_hours} ч"
                     if self.user_cooldown_hours else "повторы о человеке разрешены")
+        limit = f"лимит {self.daily_limit}/сутки" if self.daily_limit else "без лимита"
+        report = f"отчёт в {self.report_hour}:00" if self.report_hour >= 0 else "без отчёта"
         return (
             f"режим: {self.mode}, {scope}, получателей: {len(self.notify_users)}, {cooldown}, "
+            f"{limit}, {report}, "
             f"порог веса: {self.min_score}, уведомления: "
             f"{'через бота' if self.bot_token else 'с личного аккаунта'}, настройки: {self.env_file or 'переменные окружения'}"
         )
@@ -309,6 +521,16 @@ def load_settings(env: Optional[Dict[str, str]] = None, explicit_env_file: Optio
         values.get("MONITOR_KNOWN_USERS_REFRESH", ""), "MONITOR_KNOWN_USERS_REFRESH", default=5)
     settings.user_cooldown_hours = to_int(
         values.get("MONITOR_USER_COOLDOWN_HOURS", ""), "MONITOR_USER_COOLDOWN_HOURS", default=168)
+    settings.daily_limit = to_int(values.get("MONITOR_DAILY_LIMIT", ""), "MONITOR_DAILY_LIMIT", default=0)
+    settings.report_hour = to_int(values.get("MONITOR_REPORT_HOUR", ""), "MONITOR_REPORT_HOUR", default=9)
+    if settings.report_hour > 23:
+        raise ConfigError(f"MONITOR_REPORT_HOUR должно быть 0-23, а получено {settings.report_hour}")
+    csv_value = (values.get("MONITOR_LOG_CSV") or "").strip()
+    if csv_value:
+        settings.log_csv = _resolve_path(csv_value, base_dir)
+    report_state_value = (values.get("MONITOR_REPORT_STATE") or "").strip()
+    if report_state_value:
+        settings.report_state = _resolve_path(report_state_value, base_dir)
 
     # Режим: для личного аккаунта нужны api_id и api_hash, иначе — только бот
     if settings.api_id and settings.api_hash:
@@ -335,15 +557,16 @@ def load_settings(env: Optional[Dict[str, str]] = None, explicit_env_file: Optio
 # ============================== отбор сообщений ==============================
 
 
-def fuzzy_categories(text: str) -> List[Tuple[str, int]]:
+def fuzzy_categories(text: str, cfg: Optional[KeywordConfig] = None) -> List[Tuple[str, int]]:
     """Категории, найденные с учётом опечаток (для длинных слов)."""
+    cfg = cfg or load_keywords()
     found: List[Tuple[str, int]] = []
     words = re.findall(r"[а-яёa-z]{6,}", text.lower())
     if not words:
         return found
     seen = set()
     for word in words:
-        for keyword, (score, category) in FUZZY_KEYWORDS.items():
+        for keyword, (score, category) in cfg.fuzzy.items():
             if category in seen:
                 continue
             if abs(len(word) - len(keyword)) > 3:
@@ -351,30 +574,31 @@ def fuzzy_categories(text: str) -> List[Tuple[str, int]]:
             # первые две буквы должны совпадать: иначе «легализация» сойдёт за «локализацию»
             if word[:2] != keyword[:2]:
                 continue
-            if difflib.SequenceMatcher(None, word, keyword).ratio() >= FUZZY_RATIO:
+            if difflib.SequenceMatcher(None, word, keyword).ratio() >= cfg.fuzzy_ratio:
                 found.append((category, score))
                 seen.add(category)
     return found
 
 
-def score_message(text: str) -> Tuple[int, List[str], Optional[str]]:
+def score_message(text: str, cfg: Optional[KeywordConfig] = None) -> Tuple[int, List[str], Optional[str]]:
     """Оценка сообщения: (вес, категории, причина отказа)."""
+    cfg = cfg or load_keywords()
     categories: List[str] = []
     score = 0
 
-    for rule in VETO_RULES:
+    for rule in cfg.veto:
         if rule.pattern.search(text):
             if rule.score <= -50:
                 return 0, [], rule.category
             score += rule.score
             categories.append(rule.category)
 
-    for rule in RULES:
+    for rule in cfg.rules:
         if rule.pattern.search(text):
             score += rule.score
             categories.append(rule.category)
 
-    for category, extra in fuzzy_categories(text):
+    for category, extra in fuzzy_categories(text, cfg):
         if category not in categories:
             score += extra
             categories.append(category)
@@ -382,9 +606,25 @@ def score_message(text: str) -> Tuple[int, List[str], Optional[str]]:
     return score, categories, None
 
 
+def suggest_reply(categories: Sequence[str], cfg: Optional[KeywordConfig] = None) -> str:
+    """Готовый ответ под ситуацию — мастер копирует и отправляет сам."""
+    cfg = cfg or load_keywords()
+    weights = {rule.category: rule.score for rule in cfg.rules}
+    best: Optional[str] = None
+    best_weight = -1
+    for category in categories:
+        if category in cfg.replies and weights.get(category, 0) > best_weight:
+            best, best_weight = category, weights.get(category, 0)
+    return cfg.replies.get(best or "", DEFAULT_REPLY) if best else DEFAULT_REPLY
+
+
 def build_notification(*, sender_name: str, text: str, chat_title: str, chat_username: Optional[str],
-                       message_id: int, categories: Sequence[str], score: int) -> str:
-    """Текст уведомления: простой текст без разметки, чтобы ничего не «съедалось»."""
+                       message_id: int, categories: Sequence[str], score: int,
+                       reply: Optional[str] = None) -> str:
+    """Текст уведомления: простой текст без разметки, чтобы ничего не «съедалось».
+
+    В конце — готовый ответ: монитор сам в чаты не пишет, мастер копирует и отправляет.
+    """
     snippet = " ".join((text or "").split())
     if len(snippet) > 300:
         snippet = snippet[:300].rstrip() + "…"
@@ -399,6 +639,8 @@ def build_notification(*, sender_name: str, text: str, chat_title: str, chat_use
     if chat_username:
         lines.append(f"🔗 https://t.me/{chat_username}/{message_id}")
     lines.append(f"🏷 {', '.join(categories)} (вес {score})")
+    if reply:
+        lines += ["", "✍️ Готовый ответ (скопируйте и отправьте):", reply]
     return "\n".join(lines)
 
 
@@ -507,6 +749,123 @@ def repeat_reason(store: "SeenStore", sender_id: Optional[int], cooldown_hours: 
     if not sender_id or cooldown_hours <= 0:
         return None
     return store.seen_at(f"{USER_KEY_PREFIX}{int(sender_id)}")
+
+
+# ============================== журнал кандидатов и отчёт ==============================
+
+CSV_HEADER = ("time", "action", "reason", "score", "categories", "chat", "author", "link", "text")
+
+
+def _safe_cell(value: object, limit: int = 300) -> str:
+    """Значение для CSV: без переводов строк, с защитой от формул Excel."""
+    text = " ".join(str(value or "").split())[:limit]
+    if text[:1] in ("=", "+", "-", "@"):
+        text = "'" + text
+    return text
+
+
+class CandidateLog:
+    """CSV-журнал: что нашли, что отсеяли и почему — по нему видно, как настроить словарь."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+
+    def add(self, *, action: str, reason: str = "", score: int = 0, categories: Sequence[str] = (),
+            chat: str = "", author: str = "", link: str = "", text: str = "") -> None:
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            is_new = not self.path.exists() or self.path.stat().st_size == 0
+            with self.path.open("a", encoding="utf-8", newline="") as handle:
+                writer = csv.writer(handle)
+                if is_new:
+                    writer.writerow(CSV_HEADER)
+                writer.writerow([
+                    time.strftime("%Y-%m-%d %H:%M:%S"), action, reason, score,
+                    ", ".join(categories), _safe_cell(chat, 80), _safe_cell(author, 80),
+                    _safe_cell(link, 200), _safe_cell(text),
+                ])
+        except OSError as exc:
+            LOG.warning("Не удалось записать кандидата в %s: %s", self.path, exc)
+
+    def rows(self, days: int = 1) -> List[Dict[str, str]]:
+        """Записи за последние N суток (по дате в первой колонке)."""
+        try:
+            with self.path.open("r", encoding="utf-8", newline="") as handle:
+                rows = list(csv.DictReader(handle))
+        except FileNotFoundError:
+            return []
+        except OSError as exc:
+            LOG.warning("Не удалось прочитать %s: %s", self.path, exc)
+            return []
+        edge = time.time() - max(days, 1) * 86400
+        result = []
+        for row in rows:
+            try:
+                stamp = time.mktime(time.strptime(row.get("time", ""), "%Y-%m-%d %H:%M:%S"))
+            except (TypeError, ValueError):
+                continue
+            if stamp >= edge:
+                result.append(row)
+        return result
+
+    def count_today(self, action: str) -> int:
+        today = time.strftime("%Y-%m-%d")
+        return sum(1 for row in self.rows(days=1)
+                   if row.get("action") == action and str(row.get("time", "")).startswith(today))
+
+
+def build_report(rows: Sequence[Dict[str, str]]) -> str:
+    """Дневная сводка: сколько нашли, сколько уведомили, что отсеяли."""
+    notified = sum(1 for row in rows if row.get("action") == "notified")
+    found = sum(1 for row in rows if row.get("action") in {"notified", "found"})
+    reasons: Dict[str, int] = {}
+    categories: Dict[str, int] = {}
+    chats: Dict[str, int] = {}
+    for row in rows:
+        if row.get("action") == "skipped":
+            reason = row.get("reason") or "без причины"
+            reasons[reason] = reasons.get(reason, 0) + 1
+        for category in str(row.get("categories") or "").split(","):
+            category = category.strip()
+            if category:
+                categories[category] = categories.get(category, 0) + 1
+        chat = (row.get("chat") or "").strip()
+        if chat and row.get("action") == "notified":
+            chats[chat] = chats.get(chat, 0) + 1
+
+    def top(data: Dict[str, int], limit: int = 3) -> str:
+        items = sorted(data.items(), key=lambda item: item[1], reverse=True)[:limit]
+        return ", ".join(f"{name} {count}" for name, count in items) or "—"
+
+    lines = [
+        "📊 Монитор за сутки",
+        f"Найдено кандидатов: {found}, уведомлено: {notified}, отсеяно: {sum(reasons.values())}",
+        f"Причины отсева: {top(reasons, 4)}",
+        f"Категории: {top(categories, 4)}",
+        f"Чаты: {top(chats, 3)}",
+    ]
+    return "\n".join(lines)
+
+
+class ReportState:
+    """Помнит, за какой день отчёт уже отправлен, чтобы не дублировать после перезапуска."""
+
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.last_date = ""
+        try:
+            raw = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(raw, dict):
+                self.last_date = str(raw.get("last_date") or "")
+        except (FileNotFoundError, ValueError, OSError):
+            pass
+
+    def should_send(self, today: str) -> bool:
+        return self.last_date != today
+
+    def mark(self, today: str) -> None:
+        self.last_date = today
+        _atomic_write_json(self.path, {"last_date": today})
 
 
 # ============================== те, кто уже писал боту ==============================
@@ -762,19 +1121,9 @@ async def run_user_mode(settings: Settings) -> int:
     LOG.info("Фильтр «уже писал боту»: %s", known.describe())
     stats = {"found": 0, "skipped": 0, "known": 0, "repeat": 0}
 
-    def evaluate(text: str) -> Optional[Tuple[int, List[str]]]:
-        """Оценка сообщения: None — не наш случай."""
-        score, categories, veto = score_message(text)
-        if veto:
-            stats["skipped"] += 1
-            LOG.info("Пропуск (отсев: %s): %s", veto, text[:60])
-            return None
-        if score < settings.min_score:
-            stats["skipped"] += 1
-            LOG.debug("Пропуск (вес %s < %s): %s", score, settings.min_score, text[:60])
-            return None
-        stats["found"] += 1
-        return score, categories
+    log = CandidateLog(settings.log_csv)
+    report_state = ReportState(settings.report_state)
+    LOG.info("Журнал кандидатов: %s", settings.log_csv)
 
     async def handler(event) -> None:  # noqa: ANN001 — тип события задаёт telethon
         message = event.message
@@ -805,12 +1154,28 @@ async def run_user_mode(settings: Settings) -> int:
         except Exception as exc:  # noqa: BLE001
             LOG.warning("Не удалось определить автора сообщения: %s", exc)
 
+        chat_title = "Неизвестный чат"
+        chat_username = None
+        try:
+            chat = await event.get_chat()
+            chat_title = getattr(chat, "title", None) or str(getattr(chat, "id", "Неизвестный чат"))
+            chat_username = getattr(chat, "username", None)
+        except Exception as exc:  # noqa: BLE001
+            LOG.warning("Не удалось определить чат: %s", exc)
+        link = f"https://t.me/{chat_username}/{message.id}" if chat_username else ""
+
+        def log_row(action: str, reason: str = "", score: int = 0,
+                    categories: Sequence[str] = ()) -> None:
+            log.add(action=action, reason=reason, score=score, categories=categories,
+                    chat=chat_title, author=sender_name.lstrip("@"), link=link, text=text)
+
         # Уже общается с ботом — мастерам сообщать не нужно, это не новый клиент
         known.refresh()
         reason = known.is_known(getattr(sender, "id", None), getattr(sender, "username", None))
         if reason:
             stats["known"] += 1
             LOG.info("Пропуск (%s): %s — %s", reason, sender_name, text[:50])
+            log_row("skipped", reason)
             store.add(keys[0])
             return
 
@@ -821,31 +1186,43 @@ async def run_user_mode(settings: Settings) -> int:
             stats["repeat"] += 1
             LOG.info("Пропуск (о нём уже сообщали %s): %s — %s",
                      human_delta(repeat_at), sender_name, text[:50])
+            log_row("skipped", f"о нём уже сообщали ({human_delta(repeat_at)})")
             store.add(keys[0])
             return
 
-        scored = evaluate(text)
-        if scored is None:
+        score, categories, veto = score_message(text)
+        if veto:
+            stats["skipped"] += 1
+            LOG.info("Пропуск (отсев: %s): %s", veto, text[:60])
+            log_row("skipped", f"отсев: {veto}", score, categories)
             return
-        score, categories = scored
+        if score < settings.min_score:
+            stats["skipped"] += 1
+            LOG.debug("Пропуск (вес %s < %s): %s", score, settings.min_score, text[:60])
+            log_row("skipped", f"вес {score} < {settings.min_score}", score, categories)
+            return
 
-        chat_title = "Неизвестный чат"
-        chat_username = None
-        try:
-            chat = await event.get_chat()
-            chat_title = getattr(chat, "title", None) or str(getattr(chat, "id", "Неизвестный чат"))
-            chat_username = getattr(chat, "username", None)
-        except Exception as exc:  # noqa: BLE001
-            LOG.warning("Не удалось определить чат: %s", exc)
+        # Дневной лимит: защита от потока (0 — без лимита)
+        if settings.daily_limit and log.count_today("notified") >= settings.daily_limit:
+            stats["skipped"] += 1
+            LOG.info("Пропуск (дневной лимит %s): %s", settings.daily_limit, text[:50])
+            log_row("skipped", "дневной лимит", score, categories)
+            store.add(keys[0])
+            return
 
+        stats["found"] += 1
         notification = build_notification(
             sender_name=sender_name, text=text, chat_title=chat_title, chat_username=chat_username,
             message_id=message.id, categories=categories, score=score,
+            reply=suggest_reply(categories),
         )
         if settings.dry_run:
             LOG.info("[проверка] уведомление не отправлено:\n%s", notification)
+            log_row("skipped", "проверка (dry-run)", score, categories)
         else:
-            await notifier.send(notification)
+            delivered = await notifier.send(notification)
+            log_row("notified" if delivered else "skipped",
+                    "отправлено" if delivered else "не доставлено", score, categories)
         store.add(keys[0])
         store.add(keys[1])
         if sender_id:
@@ -868,12 +1245,28 @@ async def run_user_mode(settings: Settings) -> int:
                 f"повторные о человеке: {stats['repeat']}."
             )
 
+    async def daily_reporter() -> None:
+        """Раз в сутки — сводка: сколько нашли, уведомили, отсеяли."""
+        while True:
+            today = time.strftime("%Y-%m-%d")
+            if time.localtime().tm_hour == settings.report_hour and report_state.should_send(today):
+                try:
+                    await notifier.send(build_report(log.rows(days=1)))
+                    report_state.mark(today)
+                    LOG.info("Дневной отчёт отправлен")
+                except Exception as exc:  # noqa: BLE001 — отчёт не должен ронять монитор
+                    LOG.error("Не удалось отправить дневной отчёт: %s", exc)
+            await asyncio.sleep(60)
+
     heartbeat_task = asyncio.create_task(heartbeat()) if settings.heartbeat_minutes > 0 else None
+    report_task = asyncio.create_task(daily_reporter()) if settings.report_hour >= 0 else None
     try:
         await client.run_until_disconnected()
     finally:
         if heartbeat_task is not None:
             heartbeat_task.cancel()
+        if report_task is not None:
+            report_task.cancel()
         await client.disconnect()
         LOG.info("Монитор остановлен. Найдено: %s, отсеяно по правилам: %s, уже писали боту: %s, "
                  "повторные о человеке: %s",
@@ -935,16 +1328,24 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--verbose", action="store_true", help="подробный лог")
     parser.add_argument("--forget", metavar="ID_ИЛИ_ЮЗЕРНЕЙМ",
                         help="забыть человека: снова сообщать о нём мастерам")
+    parser.add_argument("--report", nargs="?", const=1, type=int, metavar="ДНЕЙ",
+                        help="показать сводку по журналу кандидатов (по умолчанию за сутки)")
     args = parser.parse_args(argv)
 
     try:
-        settings = load_settings(explicit_env_file=args.env_file, require_session=not args.forget)
+        settings = load_settings(explicit_env_file=args.env_file,
+                                 require_session=not (args.forget or args.report))
     except ConfigError as exc:
         setup_logging(None)
         LOG.error("%s", exc)
         return 2
 
     setup_logging(settings.log_file, verbose=args.verbose)
+
+    if args.report is not None:
+        rows = CandidateLog(settings.log_csv).rows(days=max(args.report, 1))
+        print(build_report(rows))
+        return 0
 
     if args.forget:
         store = SeenStore(settings.state_file, ttl_hours=settings.seen_hours,

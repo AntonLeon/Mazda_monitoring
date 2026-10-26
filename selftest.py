@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import os
 import sys
+import json
 import tempfile
 import time
 from pathlib import Path
@@ -382,6 +383,165 @@ def test_dry_run_flag():
     check("режим проверки читается из настроек", settings.dry_run is True)
 
 
+def test_dictionary_recall():
+    """Словарь должен ловить реальные формулировки клиентов и не ловить продавцов."""
+    client = [
+        "Всем привет, наконец забрал свою из Владивостока",
+        "Кто подскажет, как активировать скрытые функции на cx5?",
+        "нужна русификация приборки, кто делал?",
+        "Машина на растаможке, жду выпуск",
+        "Пришла машина, что первым делом делать?",
+        "Ищу мастера по активации скрытых опций в Москве",
+        "Посоветуйте, где сделать антикор на сх5",
+        "Сколько будет стоить русификация панели?",
+        "Приехала наконец, в субботу забираю",
+        "Кто занимается русификацией в Питере?",
+        "Хочу активировать i-stop memory",
+        "Активация опций на cx-5 2021, есть кто?",
+        "Подскажите, какое масло лить в 2.5?",
+        "Мазда сх5 из китая, проблемы с языком",
+        "Купил, но меню на китайском, что делать?",
+        "Пленка и шумка на новую сх5, цены?",
+        "Есть кто по активации в Казани?",
+        "Заказал машину, придет в декабре",
+        "Сх5 2023, руссификация нужна",
+        "Подскажите как перевести меню на русский",
+    ]
+    missed = []
+    for text in client:
+        score, categories, veto = mon.score_message(text)
+        if veto is not None or score < 3:
+            missed.append(f"{text} (вес {score}, отсев {veto})")
+    check("словарь ловит все 20 формулировок клиентов", not missed, "; ".join(missed[:4]))
+
+    noise = [
+        "Продам зимние шины на cx5, 18 радиус",
+        "Запчасти на мазду из Китая оптом",
+        "Скидка на антикор 30%!",
+        "Сдам гараж в аренду",
+        "Ищу машину сх5 до 2 млн, подскажите",
+        "Вакансия: требуется мастер по сигнализациям",
+        "Аренда бокса для ремонта",
+    ]
+    leaked = []
+    for text in noise:
+        score, _, veto = mon.score_message(text)
+        if veto is None and score >= 3:
+            leaked.append(f"{text} (вес {score})")
+    check("шум не превращается в уведомления", not leaked, "; ".join(leaked))
+
+
+def test_keywords_file():
+    """Словарь живёт в keywords.json: создаётся сам, правится без кода, битое не роняет."""
+    folder = TMP_DIR / "kw"
+    path = folder / "keywords.json"
+    cfg = mon.load_keywords(path)
+    check("keywords.json создаётся автоматически", path.exists(), str(path))
+    check("в словаре есть правила", len(cfg.rules) >= 10, str(len(cfg.rules)))
+    check("в словаре есть отсевы", len(cfg.veto) >= 3, str(len(cfg.veto)))
+    check("версия словаря актуальная",
+          json.loads(path.read_text(encoding="utf-8")).get("version") == mon.KEYWORDS_VERSION)
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    data["rules"].append({"category": "свой повод", "weight": 5, "patterns": [r"проверк\w+ связи"]})
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    cfg = mon.load_keywords(path)
+    score, categories, veto = mon.score_message("напишите про проверку связи", cfg)
+    check("правка словаря подхватывается без правки кода", "свой повод" in categories and score >= 5,
+          f"вес {score}, категории {categories}")
+
+    data["rules"].append({"category": "битая", "weight": 9, "patterns": ["["]})
+    data["rules"].append({"category": "не строка", "weight": 9, "patterns": [2, None]})
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    cfg = mon.load_keywords(path)
+    check("кривая регулярка не роняет словарь", len(cfg.rules) >= 10, str(len(cfg.rules)))
+    check("числа в patterns не становятся правилами",
+          not any(rule.pattern.pattern.strip() == "2" for rule in cfg.rules))
+
+    data["version"] = 1
+    path.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    cfg = mon.load_keywords(path)
+    check("словарь старой версии пересоздаётся",
+          json.loads(path.read_text(encoding="utf-8")).get("version") == mon.KEYWORDS_VERSION, cfg.source)
+    check("старый словарь сохраняется в .bak", (folder / "keywords.json.bak").exists())
+
+
+def test_candidate_log_and_report():
+    """Журнал кандидатов и дневная сводка."""
+    path = TMP_DIR / "cand.csv"
+    log = mon.CandidateLog(path)
+    log.add(action="notified", score=4, categories=["русификация"], chat="Mazda CX-5",
+            author="@client", link="https://t.me/c/1", text="нужна русификация")
+    log.add(action="skipped", reason="отсев: продажа/реклама", score=0, text="продам пленку")
+    log.add(action="skipped", reason="вес 2 < 3", score=2, categories=["доработки"], text="антикор сын")
+    log.add(action="notified", score=3, categories=["таможня/доставка"], chat="Автоподбор",
+            text="машина на таможне")
+
+    rows = log.rows(days=1)
+    check("журнал пишет все кандидаты", len(rows) == 4, str(len(rows)))
+    check("счётчик уведомлений за сутки", log.count_today("notified") == 2, str(log.count_today("notified")))
+
+    report = mon.build_report(rows)
+    check("в сводке есть уведомления", "уведомлено: 2" in report, report)
+    check("в сводке есть причина отсева", "продажа/реклама" in report, report)
+    check("в сводке есть категории", "русификация" in report, report)
+
+    login = TMP_DIR / "cand_inject.csv"
+    log2 = mon.CandidateLog(login)
+    log2.add(action="skipped", text="=cmd|' /C calc'!A0")
+    log2.add(action="skipped", text="обычный текст")
+    content = login.read_text(encoding="utf-8")
+    check("формулы Excel обезврежены", "'=cmd" in content, content[:120])
+    check("заголовок CSV только один", content.count("time,action") == 1, str(content.count("time,action")))
+
+    empty = mon.build_report([])
+    check("пустая сводка не падает", "Монитор за сутки" in empty, empty)
+
+
+def test_reply_and_report_settings():
+    """Готовый ответ в уведомлении и настройки отчёта/лимита."""
+    cfg = mon.load_keywords()
+    reply = mon.suggest_reply(["русификация"], cfg)
+    check("для русификации есть готовый ответ", "35 000" in reply, reply[:80])
+    check("для чужих категорий — общий ответ", mon.suggest_reply(["машина из Китая"], cfg) == mon.DEFAULT_REPLY)
+
+    text = mon.build_notification(
+        sender_name="@client", text="нужна русификация", chat_title="Чат", chat_username="chat",
+        message_id=5, categories=["русификация"], score=4, reply=reply,
+    )
+    check("в уведомлении есть готовый ответ", "Готовый ответ" in text and "35 000" in text, text[-160:])
+
+    session = TMP_DIR / "limits.session"
+    session.write_bytes(b"stub")
+    settings = mon.load_settings(env={
+        "MONITOR_API_ID": "1", "MONITOR_API_HASH": "x", "MONITOR_NOTIFY_USERS": "1",
+        "MONITOR_SESSION": str(session.with_suffix("")),
+        "MONITOR_DAILY_LIMIT": "20", "MONITOR_REPORT_HOUR": "9",
+        "MONITOR_LOG_CSV": str(TMP_DIR / "cand2.csv"),
+    })
+    check("дневной лимит читается", settings.daily_limit == 20, str(settings.daily_limit))
+    check("час отчёта читается", settings.report_hour == 9, str(settings.report_hour))
+    check("журнал кандидатов в настройках", settings.log_csv == TMP_DIR / "cand2.csv", str(settings.log_csv))
+    check("лимит и отчёт видны в описании",
+          "лимит 20/сутки" in settings.summary() and "отчёт в 9:00" in settings.summary(), settings.summary())
+
+    try:
+        mon.load_settings(env={
+            "MONITOR_API_ID": "1", "MONITOR_API_HASH": "x", "MONITOR_NOTIFY_USERS": "1",
+            "MONITOR_SESSION": str(session.with_suffix("")), "MONITOR_REPORT_HOUR": "25",
+        })
+        check("неверный час отчёта отлавливается", False, "ошибки не было")
+    except mon.ConfigError as exc:
+        check("неверный час отчёта — понятная ошибка", "MONITOR_REPORT_HOUR" in str(exc), str(exc)[:80])
+
+    state_path = TMP_DIR / "report_state.json"
+    state = mon.ReportState(state_path)
+    check("отчёт отправляется один раз в день", state.should_send("2026-10-26"))
+    state.mark("2026-10-26")
+    check("повторно в тот же день не отправляется", not mon.ReportState(state_path).should_send("2026-10-26"))
+    check("на следующий день отправляется снова", mon.ReportState(state_path).should_send("2026-10-27"))
+
+
 def main() -> int:
     for test in (
         test_real_leads_pass,
@@ -400,6 +560,10 @@ def main() -> int:
         test_known_users_filter,
         test_relative_paths_from_env_file,
         test_one_notification_per_person,
+        test_dictionary_recall,
+        test_keywords_file,
+        test_candidate_log_and_report,
+        test_reply_and_report_settings,
         test_dry_run_flag,
     ):
         print(f"\n--- {test.__name__} ---")
