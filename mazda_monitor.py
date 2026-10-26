@@ -91,12 +91,13 @@ DEFAULT_RULE_DEFS: Tuple[Tuple[str, int, Tuple[str, ...]], ...] = (
         r"приехала|машина пришла|пришла машина|жду машину|заказал[аи]? машину|еду забирать|"
         r"в пути|на подходе|фура|контейнер|порт[уа]?|владивосток|оформляю|пересел)\b",)),
     ("таможня/доставка", 3, (
-        r"\b(таможн\w*|растамож\w*|деклараци\w*|выпуск\w*|на границе|на стоянке|стоянк\w+|"
-        r"сбктс|эптс|лаборатори\w*|брокер\w*|утильсбор\w*)\b",)),
+        r"\b(таможн\w*|растамож\w*|растаможил\w*|деклараци\w*|выпуск\w*|выпустил\w*|"
+        r"на границе|на стоянке|стоянк\w+|сбктс|эптс|лаборатори\w*|брокер\w*|утильсбор\w*|"
+        r"привезл\w+|поставк\w*)\b",)),
     ("русификация", 4, (
         r"\b(русификац\w*|руссификац\w*|руссификац\w*|русский язык|перевод меню|перевести меню|"
         r"меню на китайском|проблемы с языком|язык меню|локализаци\w*|на китайском|по-русски|"
-        r"перевести|язык не переключа\w*)\b",)),
+        r"перевести|язык не переключа\w*|под русский|на русском|на русский)\b",)),
     ("скрытые функции", 3, (
         r"\b(скрыт\w+ (опци\w+|меню|функци\w+)|активаци\w*|активир\w+|активиров\w*|разблокир\w+|"
         r"включить скрыт\w+|i-stop|автозапуск\w*)\b",)),
@@ -104,9 +105,13 @@ DEFAULT_RULE_DEFS: Tuple[Tuple[str, int, Tuple[str, ...]], ...] = (
         r"\b(помогите|подскажите|подскажите пожалуйста|не могу найти|как настроить|как включить|"
         r"как активировать|как перевести|что делать|нужна помощь)\b",)),
     ("сервисный интент", 2, (
-        r"\b(где сделать|где активировать|где русифицировать|где можно|кто делает|кто занимается|"
-        r"кто может|ищу мастера|ищу специалиста|есть контакты|посоветуйте|порекомендуйте|"
-        r"к кому обратиться|кому отдать|кто в теме|подскажите мастера)\b",)),
+        r"\b(где сделать|где активировать|где русифицировать|где можно|где делали|кто делает|"
+        r"кто занимается|кто может|ищу мастера|ищу специалиста|есть контакты|посоветуйте|"
+        r"порекомендуйте|к кому обратиться|кому отдать|кто в теме|подскажите мастера|"
+        r"кто уже делал|есть отзывы|что посоветуете)\b",)),
+    ("запись к мастеру", 3, (
+        r"\b(записаться|запишусь|хочу записаться|запишите меня|можно записаться|есть окно|"
+        r"свободн\w+ окн\w+|свободное время|возьм\w+ в субботу|возьм\w+ в воскресенье)\b",)),
     ("новый владелец", 2, (
         r"\b(стал[аи]? владельц\w+|новый владелец|только купил[аи]?|первый автомобиль|первая машина)\b",)),
     ("доработки", 2, (
@@ -117,7 +122,12 @@ DEFAULT_RULE_DEFS: Tuple[Tuple[str, int, Tuple[str, ...]], ...] = (
     ("машина из Китая", 1, (
         r"\b(из китая|китайск\w+|китаец|china|cn[- ]?верси\w*)\b",)),
     ("вопрос о цене", 1, (
-        r"\b(сколько стоит|сколько будет|поч[её]м|цена|цены|стоимость|прайс|во сколько встанет)\b",)),
+        r"\b(сколько стоит|сколько будет|сколько по деньгам|поч[её]м|цена|цены|ценник|стоимость|"
+        r"прайс|во сколько встанет|по деньгам|бюджет)\b",)),
+    ("мультимедиа и меню", 1, (
+        r"\b(магнитол\w*|приборк\w*|андроид авто|android auto|меню магнитолы|навигаци\w*|карты)\b",)),
+    ("прошивка", 2, (
+        r"\b(прошивк\w*|перепрошив\w*|обновление по|обновить по)\b",)),
 )
 
 DEFAULT_VETO_DEFS: Tuple[Tuple[str, int, Tuple[str, ...]], ...] = (
@@ -191,7 +201,7 @@ DEFAULT_REPLY = ("Здравствуйте! Я мастер по CX-5 из Ки�
                  "Напишите год машины и что нужно — подскажу по цене и срокам.")
 
 KEYWORDS_FILE = BASE_DIR / "keywords.json"
-KEYWORDS_VERSION = 2
+KEYWORDS_VERSION = 3
 
 
 @dataclass
@@ -417,6 +427,7 @@ class Settings:
     daily_limit: int = 0  # 0 — без лимита уведомлений в сутки
     report_hour: int = 9  # час дневного отчёта (0-23), -1 — не присылать
     report_state: Path = field(default_factory=lambda: BASE_DIR / "monitor_report_state.json")
+    timezone: str = "Europe/Moscow"
     bot_token: Optional[str] = None
     min_score: int = 3
     heartbeat_minutes: int = 0
@@ -431,7 +442,8 @@ class Settings:
         cooldown = (f"повтор о человеке через {self.user_cooldown_hours} ч"
                     if self.user_cooldown_hours else "повторы о человеке разрешены")
         limit = f"лимит {self.daily_limit}/сутки" if self.daily_limit else "без лимита"
-        report = f"отчёт в {self.report_hour}:00" if self.report_hour >= 0 else "без отчёта"
+        report = (f"отчёт в {self.report_hour}:00 ({self.timezone})"
+                  if self.report_hour >= 0 else "без отчёта")
         return (
             f"режим: {self.mode}, {scope}, получателей: {len(self.notify_users)}, {cooldown}, "
             f"{limit}, {report}, "
@@ -523,6 +535,7 @@ def load_settings(env: Optional[Dict[str, str]] = None, explicit_env_file: Optio
         values.get("MONITOR_USER_COOLDOWN_HOURS", ""), "MONITOR_USER_COOLDOWN_HOURS", default=168)
     settings.daily_limit = to_int(values.get("MONITOR_DAILY_LIMIT", ""), "MONITOR_DAILY_LIMIT", default=0)
     settings.report_hour = to_int(values.get("MONITOR_REPORT_HOUR", ""), "MONITOR_REPORT_HOUR", default=9)
+    settings.timezone = (values.get("MONITOR_TZ") or "Europe/Moscow").strip()
     if settings.report_hour > 23:
         raise ConfigError(f"MONITOR_REPORT_HOUR должно быть 0-23, а получено {settings.report_hour}")
     csv_value = (values.get("MONITOR_LOG_CSV") or "").strip()
@@ -1118,6 +1131,8 @@ async def run_user_mode(settings: Settings) -> int:
     notifier = Notifier(settings, client)
     known = KnownUsers(settings.known_users_files, settings.ignore_users,
                        settings.known_users_refresh_minutes)
+    cfg = load_keywords()
+    LOG.info("Словарь: %s, правил: %s, отсевов: %s", cfg.source, len(cfg.rules), len(cfg.veto))
     LOG.info("Фильтр «уже писал боту»: %s", known.describe())
     stats = {"found": 0, "skipped": 0, "known": 0, "repeat": 0}
 
@@ -1306,6 +1321,15 @@ async def check_mode(settings: Settings) -> int:
 # ============================== запуск ==============================
 
 
+def apply_timezone(name: str) -> None:
+    """Часовой пояс процесса: иначе на сервере в UTC «сутки» начинаются в 21:00 по Москве."""
+    try:
+        os.environ["TZ"] = name
+        time.tzset()
+    except (AttributeError, OSError) as exc:  # Windows/неизвестный пояс — работаем как есть
+        LOG.warning("Не удалось применить часовой пояс %s: %s", name, exc)
+
+
 def setup_logging(log_file: Optional[Path], verbose: bool = False) -> None:
     handlers: List[logging.Handler] = [logging.StreamHandler(sys.stdout)]
     if log_file is not None:
@@ -1340,6 +1364,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         LOG.error("%s", exc)
         return 2
 
+    apply_timezone(settings.timezone)
     setup_logging(settings.log_file, verbose=args.verbose)
 
     if args.report is not None:

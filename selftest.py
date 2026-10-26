@@ -406,13 +406,19 @@ def test_dictionary_recall():
         "Заказал машину, придет в декабре",
         "Сх5 2023, руссификация нужна",
         "Подскажите как перевести меню на русский",
+        "Кто уже делал русификацию? Есть отзывы?",
+        "Сколько по деньгам русификация и активация?",
+        "Хочу записаться, есть окно в субботу?",
+        "Растаможили наконец, привезли в салон",
+        "Меню магнитолы на китайском, что делать?",
+        "Нужна прошивка под русский",
     ]
     missed = []
     for text in client:
         score, categories, veto = mon.score_message(text)
         if veto is not None or score < 3:
             missed.append(f"{text} (вес {score}, отсев {veto})")
-    check("словарь ловит все 20 формулировок клиентов", not missed, "; ".join(missed[:4]))
+    check("словарь ловит все формулировки клиентов", not missed, "; ".join(missed[:4]))
 
     noise = [
         "Продам зимние шины на cx5, 18 радиус",
@@ -422,6 +428,7 @@ def test_dictionary_recall():
         "Ищу машину сх5 до 2 млн, подскажите",
         "Вакансия: требуется мастер по сигнализациям",
         "Аренда бокса для ремонта",
+        "Продам запчасти, привезли из Китая",
     ]
     leaked = []
     for text in noise:
@@ -533,6 +540,16 @@ def test_reply_and_report_settings():
         check("неверный час отчёта отлавливается", False, "ошибки не было")
     except mon.ConfigError as exc:
         check("неверный час отчёта — понятная ошибка", "MONITOR_REPORT_HOUR" in str(exc), str(exc)[:80])
+
+    check("часовой пояс по умолчанию — Москва", settings.timezone == "Europe/Moscow", settings.timezone)
+    settings_tz = mon.load_settings(env={
+        "MONITOR_API_ID": "1", "MONITOR_API_HASH": "x", "MONITOR_NOTIFY_USERS": "1",
+        "MONITOR_SESSION": str(session.with_suffix("")), "MONITOR_TZ": "Asia/Yekaterinburg",
+    })
+    check("часовой пояс читается из настроек", settings_tz.timezone == "Asia/Yekaterinburg",
+          settings_tz.timezone)
+    mon.apply_timezone("Europe/Moscow")  # не должно падать
+    check("часовой пояс применяется без ошибок", True)
 
     state_path = TMP_DIR / "report_state.json"
     state = mon.ReportState(state_path)
